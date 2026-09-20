@@ -1,0 +1,419 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   IAM console design system
+   ───────────────────────────────────────────────────────────────────────────
+   One stylesheet, three consoles (/admin-ui, /tenant-ui, /portal). They are
+   the same product seen from three vantage points, so they get one visual
+   language rather than three that drift apart.
+
+   Dark by construction, not as a theme toggle: this is an operations surface
+   people keep open next to a terminal. Navy carries every interactive and
+   structural cue; colour is spent only on state that matters (allowed,
+   denied, pending, suspended), so a red chip on the page means something.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* Surfaces — a near-black with a blue cast, lifting in even steps */
+  --bg:          #05070d;
+  --surface:     #0a0e18;
+  --surface-2:   #0e1424;
+  --surface-3:   #131b2e;
+  --border:      #1b2438;
+  --border-lit:  #27334d;
+
+  --text:        #e7ecf7;
+  --text-dim:    #9aa8c4;
+  --muted:       #6b7a99;
+
+  /* Navy is the product colour: actions, focus, selection, links */
+  --navy:        #2f5fe0;
+  --navy-lit:    #4e7cf5;
+  --navy-deep:   #16265c;
+  --navy-wash:   rgba(47, 95, 224, .12);
+  --navy-glow:   rgba(47, 95, 224, .30);
+
+  --ok:          #2dd4a7;
+  --ok-wash:     rgba(45, 212, 167, .12);
+  --warn:        #f0b429;
+  --warn-wash:   rgba(240, 180, 41, .12);
+  --danger:      #f2555a;
+  --danger-wash: rgba(242, 85, 90, .12);
+
+  --r-sm: 8px;
+  --r:    12px;
+  --r-lg: 18px;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 28px rgba(0,0,0,.35);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+/* The browser's own `[hidden] { display: none }` is a plain element-less rule,
+   so ANY stylesheet rule that sets `display` outruns it — `main { display:flex }`
+   below is enough to make `<main hidden>` render anyway. Every "show this after
+   login" element in these consoles is toggled with the hidden attribute, so
+   without this line the whole console paints before anyone has signed in.
+   It must come before the rules that set display, and it must be !important. */
+[hidden] { display: none !important; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--bg);
+  /* Two very soft navy pools, top-left and far right — enough to stop a pure
+     black field from reading as flat, not enough to compete with content. */
+  background-image:
+    radial-gradient(900px 500px at 12% -8%, rgba(47,95,224,.16), transparent 62%),
+    radial-gradient(800px 600px at 108% 8%, rgba(22,38,92,.28), transparent 60%);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Layout ───────────────────────────────────────────────────────────── */
+
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 0 24px; height: 60px;
+  background: rgba(5,7,13,.72);
+  backdrop-filter: blur(14px) saturate(140%);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.brand { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.brand .mark {
+  width: 28px; height: 28px; flex: none; border-radius: 9px;
+  background: linear-gradient(145deg, var(--navy-lit), var(--navy-deep));
+  box-shadow: 0 0 0 1px var(--border-lit), 0 4px 14px var(--navy-glow);
+  display: grid; place-items: center;
+  font-size: 13px; font-weight: 700; color: #fff; letter-spacing: -.02em;
+}
+.brand h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: -.01em; white-space: nowrap; }
+.brand .sub {
+  font-size: 11px; color: var(--muted); font-family: var(--mono);
+  padding-left: 11px; margin-left: 2px; border-left: 1px solid var(--border);
+  white-space: nowrap;
+}
+.topbar .right { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-dim); flex-wrap: wrap; }
+
+main {
+  max-width: 1160px; margin: 0 auto;
+  padding: 26px 24px 80px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+
+/* ── View switcher ────────────────────────────────────────────────────── */
+
+.views {
+  display: flex; gap: 4px; padding: 4px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+}
+.views button {
+  background: transparent; color: var(--muted); box-shadow: none; border: none;
+  font-weight: 600; padding: 6px 13px; border-radius: 7px;
+}
+.views button:hover { color: var(--text); filter: none; }
+.views button.on {
+  background: var(--navy-wash); color: #9dbaff;
+  box-shadow: inset 0 0 0 1px rgba(47,95,224,.32);
+}
+.views button .count {
+  display: inline-block; margin-left: 6px; padding: 0 5px;
+  border-radius: 99px; background: var(--surface-3); color: var(--text-dim);
+  font-size: 10px; font-weight: 700;
+}
+
+/* ── Card ─────────────────────────────────────────────────────────────── */
+
+.card {
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 20px 22px;
+  box-shadow: var(--shadow);
+}
+.card > h2 {
+  display: flex; align-items: center; gap: 9px;
+  font-size: 12px; font-weight: 600; margin: 0;
+  text-transform: uppercase; letter-spacing: .09em; color: var(--text-dim);
+}
+.card > h2::before {
+  content: ''; width: 3px; height: 13px; border-radius: 2px; flex: none;
+  background: linear-gradient(var(--navy-lit), var(--navy));
+}
+.card .hint { font-size: 12.5px; color: var(--muted); margin: 8px 0 16px; max-width: 76ch; }
+.card > h2 + .hint { margin-top: 9px; }
+
+/* ── Type helpers ─────────────────────────────────────────────────────── */
+
+.muted { color: var(--muted); font-size: 12px; }
+.mono, code { font-family: var(--mono); font-size: 12px; }
+code {
+  background: var(--surface-3); border: 1px solid var(--border);
+  padding: 1.5px 6px; border-radius: 6px; color: #b9c9ea;
+}
+a { color: var(--navy-lit); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ── Table ────────────────────────────────────────────────────────────── */
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 10px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+th {
+  color: var(--muted); font-weight: 600; font-size: 10.5px;
+  text-transform: uppercase; letter-spacing: .08em;
+  border-bottom-color: var(--border-lit);
+}
+tbody tr { transition: background .12s ease; }
+tbody tr:hover { background: rgba(47,95,224,.05); }
+tbody tr:last-child td { border-bottom: none; }
+td.nowrap { white-space: nowrap; }
+
+/* ── Controls ─────────────────────────────────────────────────────────── */
+
+input, select, textarea {
+  background: var(--bg);
+  border: 1px solid var(--border-lit);
+  color: var(--text);
+  border-radius: var(--r-sm);
+  padding: 8px 11px;
+  font-size: 13px;
+  font-family: inherit;
+  transition: border-color .14s ease, box-shadow .14s ease, background .14s ease;
+  min-width: 0;
+}
+input::placeholder, textarea::placeholder { color: #4d5b78; }
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--navy);
+  box-shadow: 0 0 0 3px var(--navy-wash);
+  background: var(--surface);
+}
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath fill='%236b7a99' d='M0 0h10L5 6z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 11px center;
+  padding-right: 30px;
+}
+label.field { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; color: var(--text-dim); min-width: 0; }
+label.field .tip { color: var(--muted); font-weight: 400; }
+
+button {
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  padding: 8px 14px;
+  font-size: 12.5px; font-weight: 550;
+  font-family: inherit;
+  color: #fff;
+  background: linear-gradient(180deg, var(--navy-lit), var(--navy));
+  box-shadow: 0 1px 0 rgba(255,255,255,.08) inset, 0 3px 12px var(--navy-glow);
+  transition: transform .1s ease, filter .14s ease, box-shadow .14s ease, background .14s ease;
+  white-space: nowrap;
+}
+button:hover { filter: brightness(1.1); }
+button:active { transform: translateY(1px); }
+button:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--navy-wash); }
+button.ghost {
+  background: var(--surface-3); color: var(--text-dim);
+  border-color: var(--border-lit); box-shadow: none;
+}
+button.ghost:hover { color: var(--text); border-color: var(--navy); background: var(--surface-3); filter: none; }
+button.danger {
+  background: transparent; color: var(--danger);
+  border-color: rgba(242,85,90,.35); box-shadow: none;
+}
+button.danger:hover { background: var(--danger-wash); filter: none; }
+button.tiny { padding: 4px 9px; font-size: 11.5px; }
+button:disabled { opacity: .45; cursor: not-allowed; transform: none; filter: none; }
+
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.spread { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; flex-wrap: wrap; }
+
+/* ── Chips & badges ───────────────────────────────────────────────────── */
+
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--surface-3); border: 1px solid var(--border-lit);
+  border-radius: 999px; padding: 3px 10px; margin: 2px 3px 2px 0;
+  font-size: 11.5px; color: var(--text-dim);
+  font-family: var(--mono);
+}
+.chip.navy { background: var(--navy-wash); border-color: rgba(47,95,224,.4); color: #9dbaff; }
+.chip button {
+  all: unset; cursor: pointer; color: var(--muted);
+  font-size: 13px; line-height: 1; padding: 0 1px;
+}
+.chip button:hover { color: var(--danger); }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  border-radius: 999px; padding: 2.5px 9px;
+  font-size: 10.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.badge::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
+.badge.plain::before { display: none; }
+.badge.ok, .badge.active, .badge.approved, .badge.allow {
+  background: var(--ok-wash); color: var(--ok); border-color: rgba(45,212,167,.3);
+}
+.badge.warn, .badge.pending, .badge.unchecked {
+  background: var(--warn-wash); color: var(--warn); border-color: rgba(240,180,41,.3);
+}
+.badge.bad, .badge.deny, .badge.rejected, .badge.suspended, .badge.inactive, .badge.unreachable {
+  background: var(--danger-wash); color: var(--danger); border-color: rgba(242,85,90,.3);
+}
+.badge.info { background: var(--navy-wash); color: #9dbaff; border-color: rgba(47,95,224,.35); }
+
+/* A live service gets a gently pulsing dot; a dead one does not. */
+.badge.ok::before { animation: pulse 2.4s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* ── Banners ──────────────────────────────────────────────────────────── */
+
+#banners {
+  position: fixed; top: 72px; right: 20px; z-index: 60;
+  display: flex; flex-direction: column; gap: 8px;
+  max-width: min(440px, calc(100vw - 40px));
+}
+.banner {
+  display: flex; gap: 10px; align-items: flex-start;
+  border-radius: var(--r); padding: 11px 14px;
+  font-size: 12.5px; line-height: 1.5;
+  border: 1px solid var(--border-lit);
+  background: var(--surface-2);
+  box-shadow: var(--shadow);
+  animation: slide-in .2s cubic-bezier(.2,.8,.3,1);
+}
+@keyframes slide-in { from { opacity: 0; transform: translateX(14px); } }
+.banner.err  { border-color: rgba(242,85,90,.4); background: linear-gradient(var(--danger-wash), var(--surface-2)); color: #ffc9cb; }
+.banner.ok   { border-color: rgba(45,212,167,.4); background: linear-gradient(var(--ok-wash), var(--surface-2)); color: #a9f0da; }
+.banner.warn { border-color: rgba(240,180,41,.4); background: linear-gradient(var(--warn-wash), var(--surface-2)); color: #f7dda3; }
+.banner .x { all: unset; cursor: pointer; color: var(--muted); margin-left: auto; font-size: 14px; line-height: 1; }
+.banner .x:hover { color: var(--text); }
+
+/* ── Auth card ────────────────────────────────────────────────────────── */
+
+.auth {
+  width: min(390px, calc(100vw - 32px));
+  margin: 13vh auto; display: flex; flex-direction: column; gap: 11px;
+}
+.auth h2 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
+.auth input { width: 100%; }
+.tabs { display: flex; gap: 6px; padding: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); }
+.tabs button {
+  flex: 1; background: transparent; color: var(--muted);
+  box-shadow: none; border: none; font-weight: 600;
+}
+.tabs button:hover { color: var(--text); filter: none; }
+.tabs button.on { background: var(--navy-wash); color: #9dbaff; }
+
+/* ── Disclosure / expandable rows ─────────────────────────────────────── */
+
+details.panel {
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  overflow: hidden;
+  transition: border-color .14s ease;
+}
+details.panel + details.panel { margin-top: 10px; }
+details.panel[open] { border-color: var(--border-lit); }
+details.panel > summary {
+  cursor: pointer; list-style: none; padding: 14px 16px;
+  display: flex; align-items: center; gap: 12px;
+  transition: background .12s ease;
+}
+details.panel > summary::-webkit-details-marker { display: none; }
+details.panel > summary:hover { background: rgba(47,95,224,.05); }
+details.panel > summary .caret {
+  width: 16px; flex: none; color: var(--muted);
+  transition: transform .16s ease; font-size: 10px;
+}
+details.panel[open] > summary .caret { transform: rotate(90deg); color: var(--navy-lit); }
+details.panel > .body { padding: 4px 16px 18px; border-top: 1px solid var(--border); }
+
+/* ── Sub-sections inside an expanded tenant ───────────────────────────── */
+
+.sub { padding: 16px 0; border-bottom: 1px dashed var(--border); }
+.sub:last-child { border-bottom: none; padding-bottom: 4px; }
+.sub > h3 {
+  font-size: 10.5px; font-weight: 650; margin: 0 0 10px;
+  text-transform: uppercase; letter-spacing: .09em; color: var(--muted);
+}
+.empty { color: var(--muted); font-size: 12.5px; font-style: italic; padding: 6px 0; }
+
+/* ── Wire inspector (access test) ─────────────────────────────────────── */
+
+pre.wire {
+  margin: 8px 0 0;
+  padding: 11px 13px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+  color: #b9c9ea;
+  /* A response body is the one thing here that may legitimately be wide;
+     it scrolls inside its own box rather than stretching the modal. */
+  overflow-x: auto; white-space: pre; max-height: 320px; overflow-y: auto;
+}
+.kv.wire { grid-template-columns: minmax(110px, auto) 1fr; gap: 3px 12px; margin-top: 8px; }
+.kv.wire dt { text-transform: none; letter-spacing: 0; font-family: var(--mono); font-size: 11px; }
+.kv.wire dd { font-size: 11.5px; }
+
+/* ── Key/value list ───────────────────────────────────────────────────── */
+
+.kv { display: grid; grid-template-columns: 116px 1fr; gap: 7px 14px; font-size: 12.5px; align-items: baseline; }
+.kv dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.kv dd { margin: 0; font-family: var(--mono); color: var(--text-dim); word-break: break-all; }
+
+/* ── Modal ────────────────────────────────────────────────────────────── */
+
+.backdrop {
+  display: none; position: fixed; inset: 0; z-index: 50;
+  background: rgba(2,4,9,.72); backdrop-filter: blur(4px);
+  align-items: flex-start; justify-content: center; padding: 7vh 16px;
+}
+.backdrop.on { display: flex; }
+.modal {
+  width: min(720px, 100%); max-height: 84vh; overflow: auto;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  border: 1px solid var(--border-lit); border-radius: var(--r-lg);
+  padding: 22px 24px; box-shadow: var(--shadow);
+  animation: pop .18s cubic-bezier(.2,.8,.3,1);
+}
+@keyframes pop { from { opacity: 0; transform: translateY(-8px) scale(.99); } }
+.modal h2 { margin: 0 0 3px; font-size: 15px; font-weight: 600; }
+
+/* ── Scrollbar ────────────────────────────────────────────────────────── */
+
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-lit); border-radius: 99px; border: 3px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: #33425f; }
+
+/* ── Narrow screens ───────────────────────────────────────────────────── */
+
+@media (max-width: 720px) {
+  main { padding: 18px 14px 60px; }
+  .card { padding: 16px 14px; border-radius: var(--r); }
+  .topbar { height: auto; padding: 12px 14px; }
+  .kv { grid-template-columns: 1fr; gap: 2px 0; }
+  .kv dd { margin-bottom: 8px; }
+  /* Tables are the one thing allowed to scroll sideways, inside their own box. */
+  .scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .scroll-x table { min-width: 560px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

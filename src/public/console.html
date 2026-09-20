@@ -1,0 +1,819 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>IAM Console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/assets/theme.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <div class="mark">IAM</div>
+    <h1>Console</h1>
+    <span class="sub" id="sub" hidden></span>
+  </div>
+  <div class="views" id="views" hidden></div>
+  <div class="right" id="whoami"></div>
+</div>
+
+<!-- ── One sign-in for everybody. What you see afterwards depends on what the
+     server says you are, not on which URL you happened to open. ── -->
+<div id="auth" class="card auth">
+  <div class="tabs">
+    <button id="tab-login" class="on">Log in</button>
+    <button id="tab-signup">Sign up</button>
+  </div>
+  <input id="u" placeholder="username" autocomplete="username">
+  <input id="p" placeholder="password" type="password" autocomplete="current-password">
+  <button id="go">Log in</button>
+  <p class="muted" style="margin:2px 0 0">
+    One account for the whole gateway. Sign in and you get exactly the consoles you
+    are entitled to — request access to a service, run a service you own, or
+    administer the platform.
+  </p>
+</div>
+
+<main id="app" hidden>
+
+  <!-- ══ MY ACCESS — everyone ══════════════════════════════════════════ -->
+  <div id="view-access" class="stack" hidden>
+    <section class="card">
+      <div class="spread">
+        <div>
+          <h2>Your access</h2>
+          <p class="hint">Roles are granted per service by whoever owns that service.</p>
+        </div>
+        <button id="test-mine" class="ghost">Test my access</button>
+      </div>
+      <p class="hint" style="margin-top:0">
+        The test calls every endpoint on the gateway with your own token and shows the whole
+        exchange — the claims the gateway reads, the request it sent, and the status and body
+        that came back. It is the same probe a service owner runs against their members.
+      </p>
+      <div id="mine"></div>
+    </section>
+
+    <section class="card">
+      <h2>Services</h2>
+      <p class="hint">
+        Requesting access sends your request to <em>that service's</em> administrators — not to a
+        central admin — and they choose which of their roles you get.
+      </p>
+      <div class="scroll-x">
+        <table>
+          <thead><tr><th>Service</th><th>Run by</th><th>Endpoints</th><th>Roles you can ask for</th><th></th></tr></thead>
+          <tbody id="catalog"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Your requests</h2>
+      <div class="scroll-x">
+        <table>
+          <thead><tr><th>Requested</th><th>Sent to</th><th>Note</th><th>Status</th></tr></thead>
+          <tbody id="my-requests"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Platform roles</h2>
+      <p class="hint">Global roles granted by the platform administrator. Prefer requesting a
+        service above — that reaches the people who actually run it.</p>
+      <div class="scroll-x">
+        <table>
+          <thead><tr><th>Role</th><th></th></tr></thead>
+          <tbody id="catalog-roles"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <!-- ══ MY SERVICES — tenant owners/admins ═══════════════════════════ -->
+  <div id="view-services" class="stack" hidden>
+    <section class="card">
+      <div class="spread">
+        <div>
+          <h2>Register a service</h2>
+          <p class="hint">
+            Registering creates a tenant named after your service and makes you its administrator.
+            <strong>The service does not have to be running yet</strong> — if the catalog URL can't
+            be reached it is registered from what you type here, and the registry picks up live
+            metadata as soon as it comes online.
+          </p>
+        </div>
+        <button id="reg-toggle" class="ghost">+ New service</button>
+      </div>
+
+      <form id="reg" class="card grid" hidden style="background:var(--bg)">
+        <label class="field">Service name <span class="tip">lowercase; becomes /gateway/&lt;name&gt;</span>
+          <input name="name" placeholder="payments" required pattern="[a-z0-9][a-z0-9_-]{1,62}">
+        </label>
+        <label class="field">Base URL <span class="tip">where it listens</span>
+          <input name="baseUrl" placeholder="http://localhost:9090" required>
+        </label>
+        <label class="field">Catalog URL <span class="tip">optional</span>
+          <input name="catalogUrl" placeholder="http://localhost:9090/catalog">
+        </label>
+        <label class="field">Display name <span class="tip">optional</span>
+          <input name="displayName" placeholder="Payments API">
+        </label>
+        <label class="field" style="grid-column:1/-1">Endpoints <span class="tip">comma separated — each must start with /&lt;name&gt;/</span>
+          <input name="endpoints" placeholder="/payments/charge, /payments/refund">
+        </label>
+        <div class="row" style="grid-column:1/-1">
+          <button type="submit">Register</button>
+          <button type="button" class="ghost" id="reg-cancel">Cancel</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" id="own-card" hidden>
+      <div class="spread">
+        <div>
+          <h2 id="own-name">Tenant</h2>
+          <p class="hint" id="own-hint"></p>
+        </div>
+        <div class="row" id="own-meta"></div>
+      </div>
+      <div id="own-panel"></div>
+    </section>
+  </div>
+
+  <!-- ══ PLATFORM — platform admin ════════════════════════════════════ -->
+  <div id="view-platform" class="stack" hidden>
+    <section class="card">
+      <div class="spread">
+        <div>
+          <h2>Tenants &amp; services</h2>
+          <p class="hint">
+            Every service on this gateway is a tenant: one row holds its routes, its roles, its
+            policies and its users. Expand a row to manage all of it, or hand it an owner and let
+            their team run it themselves.
+          </p>
+        </div>
+        <button id="new-tenant-toggle" class="ghost">+ Register</button>
+      </div>
+
+      <form id="new-tenant" class="card grid" hidden style="background:var(--bg);margin-bottom:16px">
+        <label class="field">Name <span class="tip">lowercase; becomes /gateway/&lt;name&gt;</span>
+          <input name="id" placeholder="payments" required pattern="[a-z0-9][a-z0-9_-]{1,62}">
+        </label>
+        <label class="field">Display name <span class="tip">optional</span>
+          <input name="displayName" placeholder="Payments API">
+        </label>
+        <label class="field">Base URL <span class="tip">where the service listens</span>
+          <input name="baseUrl" placeholder="http://localhost:9090">
+        </label>
+        <label class="field">Catalog URL <span class="tip">optional; may be offline</span>
+          <input name="catalogUrl" placeholder="http://localhost:9090/catalog">
+        </label>
+        <label class="field">Owner <span class="tip">existing account; becomes its first admin</span>
+          <input name="owner" placeholder="alice">
+        </label>
+        <label class="field">Version <span class="tip">optional</span>
+          <input name="version" placeholder="v1">
+        </label>
+        <label class="field" style="grid-column:1/-1">Endpoints <span class="tip">comma separated — each must start with /&lt;name&gt;/</span>
+          <input name="endpoints" placeholder="/payments/charge, /payments/refund">
+        </label>
+        <div class="row" style="grid-column:1/-1">
+          <button type="submit">Register tenant</button>
+          <button type="button" class="ghost" id="new-tenant-cancel">Cancel</button>
+          <span class="muted">The service does not have to be running — an unreachable catalog is a warning, not a failure.</span>
+        </div>
+      </form>
+
+      <div id="tenants"></div>
+    </section>
+
+    <section class="card">
+      <h2>Platform accounts</h2>
+      <p class="hint">Identities are platform-wide — one account reaches every tenant it has been
+        granted a role in. Tenant membership is managed inside each tenant above.</p>
+      <div class="scroll-x">
+        <table>
+          <thead><tr><th>Username</th><th>Primary role</th><th>Subjects held</th><th></th></tr></thead>
+          <tbody id="users"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Platform requests</h2>
+      <p class="hint">Requests that name no tenant, so no tenant's admins can resolve them.
+        Tenant-scoped requests appear inside their own tenant above.</p>
+      <div class="row" style="margin-bottom:10px">
+        <select id="req-filter">
+          <option value="pending" selected>pending</option>
+          <option value="">all</option>
+          <option value="approved">approved</option>
+          <option value="rejected">rejected</option>
+        </select>
+      </div>
+      <div class="scroll-x">
+        <table>
+          <thead><tr><th>User</th><th>Wants</th><th>Note</th><th>Status</th><th></th></tr></thead>
+          <tbody id="requests"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(330px,1fr))">
+      <section class="card">
+        <h2>Platform roles</h2>
+        <p class="hint">Global roles that predate tenancy. Prefer a tenant's own roles for new work.</p>
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>Role</th><th>Members</th></tr></thead>
+            <tbody id="roles"></tbody>
+          </table>
+        </div>
+        <form id="new-role" class="row" style="margin-top:12px">
+          <input name="role" placeholder="role_name" required>
+          <button type="submit">Add</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Platform policies</h2>
+        <p class="hint">Rules whose subject is not scoped to a tenant.</p>
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>Subject</th><th>Resource</th><th>Action</th><th></th></tr></thead>
+            <tbody id="policies"></tbody>
+          </table>
+        </div>
+        <form id="new-policy" class="row" style="margin-top:12px">
+          <input name="subject" placeholder="subject" required style="width:110px">
+          <input name="resource" placeholder="/service/path" required style="width:140px">
+          <input name="action" placeholder="get" required style="width:70px">
+          <button type="submit">Add</button>
+        </form>
+      </section>
+    </div>
+  </div>
+
+</main>
+
+<script type="module">
+import {
+  esc, chips, badge, ok, err, session, makeApi, parseList, relTime, confirmDanger,
+  entitledViews, defaultView,
+} from '/assets/app.js';
+import { TenantPanel } from '/assets/tenant-panel.js';
+import { accessTestModalHtml, wireAccessTestModal, runAccessTest } from '/assets/access-test.js';
+
+document.body.insertAdjacentHTML('beforeend', accessTestModalHtml);
+wireAccessTestModal();
+
+// One token for the whole gateway — three separate session keys was three
+// separate logins for the same account, which is what made this feel like
+// three products instead of one.
+const sess = session('iam_token');
+const api = makeApi(sess);
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  me: null,
+  mode: 'login',
+  view: null,
+  ownTenants: [],      // tenants this account administers
+  currentOwn: null,
+  tenants: [],         // platform: every tenant
+  openTenant: null,
+  roles: [],
+};
+
+let ownPanel = null;
+const adminPanels = new Map();
+
+// ── who gets which view ─────────────────────────────────────────────────
+//
+// Entitlement is read from the server's answer to /me, never from the URL:
+// opening /admin-ui does not make you an admin. The rule itself lives in
+// app.js so it can be tested directly against live account data.
+
+const myViews = () => entitledViews(state.me, state.ownTenants);
+
+function showView(id) {
+  state.view = id;
+  for (const v of ['access', 'services', 'platform']) $(`view-${v}`).hidden = v !== id;
+  for (const b of $('views').querySelectorAll('button')) b.classList.toggle('on', b.dataset.view === id);
+  loadView(id).catch(() => {});
+}
+
+function renderChrome() {
+  const me = state.me;
+  const views = myViews();
+
+  $('views').hidden = views.length < 2;
+  $('views').innerHTML = views.map((v) => `
+    <button data-view="${v.id}">${esc(v.label)}${v.count ? `<span class="count">${v.count}</span>` : ''}</button>`).join('');
+  $('views').querySelectorAll('button').forEach((b) =>
+    b.addEventListener('click', () => showView(b.dataset.view)));
+
+  $('sub').hidden = false;
+  $('sub').textContent = me.isPlatformAdmin ? 'platform admin'
+    : state.ownTenants.length ? 'service owner' : 'member';
+
+  $('whoami').innerHTML =
+    `<span class="mono">${esc(me.username)}</span>`
+    + (me.isPlatformAdmin ? badge('info', 'admin') : '')
+    + `<button class="ghost" id="out">Log out</button>`;
+  $('out').addEventListener('click', logout);
+}
+
+// ── auth ────────────────────────────────────────────────────────────────
+
+function setMode(mode) {
+  state.mode = mode;
+  $('tab-login').classList.toggle('on', mode === 'login');
+  $('tab-signup').classList.toggle('on', mode === 'signup');
+  $('go').textContent = mode === 'login' ? 'Log in' : 'Sign up';
+}
+$('tab-login').addEventListener('click', () => setMode('login'));
+$('tab-signup').addEventListener('click', () => setMode('signup'));
+
+async function submitAuth() {
+  const username = $('u').value.trim();
+  const password = $('p').value;
+  if (!username || !password) return err('Enter a username and password');
+
+  if (state.mode === 'signup') {
+    const r = await fetch('/auth/signup', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) return err(b.error || 'Signup failed');
+    ok('Account created.');
+  }
+
+  const res = await fetch('/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) return err(body.error || 'Login failed');
+
+  sess.token = body.token;
+  $('u').value = '';
+  $('p').value = '';
+  await enter();
+}
+
+function logout() {
+  api('/auth/logout', { method: 'POST' }).catch(() => {});
+  sess.token = null;
+  state.me = null;
+  ownPanel = null;
+  adminPanels.clear();
+  $('app').hidden = true;
+  for (const v of ['access', 'services', 'platform']) $(`view-${v}`).hidden = true;
+  $('views').hidden = true;
+  $('sub').hidden = true;
+  $('whoami').innerHTML = '';
+  $('auth').hidden = false;
+  setMode('login');
+}
+
+async function enter() {
+  state.me = await api('/me');
+  const mine = await api('/tenants/mine');
+  state.ownTenants = mine.tenants.filter((t) => t.isAdmin);
+
+  $('auth').hidden = true;
+  $('app').hidden = false;
+  renderChrome();
+
+  // Land on the most privileged thing this account can actually do, so the
+  // first screen is the one they came for.
+  showView(defaultView(myViews()));
+}
+
+async function loadView(id) {
+  if (id === 'access') return refreshAccess();
+  if (id === 'services') return refreshOwn();
+  if (id === 'platform') return refreshPlatform();
+  return undefined;
+}
+
+// ══ VIEW: my access ═════════════════════════════════════════════════════
+
+async function refreshAccess() {
+  const [me, services, roles, requests] = await Promise.all([
+    api('/me'), api('/catalog/services'), api('/catalog/roles'), api('/requests/me'),
+  ]);
+  state.me = me;
+
+  $('mine').innerHTML = me.tenants.length
+    ? `<div class="scroll-x"><table>
+        <thead><tr><th>Service</th><th>Your roles there</th><th></th></tr></thead>
+        <tbody>${me.tenants.map((t) => `
+          <tr>
+            <td><strong>${esc(t.displayName)}</strong><div class="muted mono">${esc(t.id)}</div></td>
+            <td>${chips(t.roles, { cls: 'navy' }) || '<span class="muted">member, no role yet</span>'}</td>
+            <td class="nowrap">${t.isAdmin ? badge('info', 'you administer this') : ''}</td>
+          </tr>`).join('')}</tbody>
+      </table></div>`
+    : '<p class="empty">No access to any service yet — request one below.</p>';
+
+  $('catalog').innerHTML = services.services.length ? services.services.map((s) => {
+    const t = s.tenant;
+    const rs = t?.roles || [];
+    let control;
+    if (t && t.joined && !rs.length) control = '<span class="muted">you\'re already in</span>';
+    else if (t && rs.length) {
+      control = `<select data-role-for="${esc(s.name)}">${
+        rs.map((r) => `<option value="${esc(r)}">${esc(r)}</option>`).join('')}</select>
+        <button class="ghost tiny" data-req-role data-tenant="${esc(t.id)}" data-service="${esc(s.name)}">Request</button>`;
+    } else if (t) {
+      control = `<button class="ghost tiny" data-req-tenant data-tenant="${esc(t.id)}" data-service="${esc(s.name)}">Request access</button>`;
+    } else {
+      control = `<button class="ghost tiny" data-req-service data-service="${esc(s.name)}">Request access</button>`;
+    }
+    return `
+      <tr>
+        <td><strong>${esc(s.name)}</strong>${t?.joined ? ` ${badge('ok', 'joined')}` : ''}</td>
+        <td class="muted">${esc(t?.displayName || s.owner || '')}</td>
+        <td>${(s.endpoints || []).length
+          ? (s.endpoints || []).map((e) => `<code>${esc(e)}</code>`).join(' ')
+          : '<span class="muted">none published</span>'}</td>
+        <td>${chips(rs, { cls: 'navy' }) || '<span class="muted">none published</span>'}</td>
+        <td class="nowrap"><div class="row">${control}</div></td>
+      </tr>`;
+  }).join('')
+    : '<tr><td colspan="5" class="empty">No services registered.</td></tr>';
+
+  $('catalog-roles').innerHTML = roles.roles.map((r) => `
+    <tr><td class="mono">${esc(r)}</td>
+      <td class="nowrap"><button class="ghost tiny" data-req-platform="${esc(r)}">Request</button></td></tr>`).join('');
+
+  $('my-requests').innerHTML = requests.requests.length ? requests.requests.map((r) => `
+    <tr>
+      <td>${r.role ? `<span class="chip navy">${esc(r.role)}</span>` : `<span class="muted">${esc(r.service || '—')}</span>`}
+        <div class="muted">${esc(relTime(r.requestedAt))}</div></td>
+      <td class="muted">${r.tenant ? `the ${esc(r.tenant)} team` : 'platform admin'}</td>
+      <td class="muted">${esc(r.note || '')}</td>
+      <td>${badge(r.status, r.status)}
+        ${r.grantedRole && r.grantedRole !== r.role ? `<div class="muted">granted ${esc(r.grantedRole)}</div>` : ''}
+        ${r.resolvedBy ? `<div class="muted">by ${esc(r.resolvedBy)}</div>` : ''}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="4" class="empty">No requests yet.</td></tr>';
+}
+
+async function submitRequest(body) {
+  await api('/requests', { method: 'POST', body });
+  ok("Request submitted — the service's administrators will review it.");
+  await refreshAccess();
+}
+
+$('catalog').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const service = btn.dataset.service;
+  if (btn.dataset.reqRole !== undefined) {
+    const sel = document.querySelector(`select[data-role-for="${CSS.escape(service)}"]`);
+    await submitRequest({ tenant: btn.dataset.tenant, role: sel.value, note: `Requested '${sel.value}' on ${service}` });
+  } else if (btn.dataset.reqTenant !== undefined) {
+    await submitRequest({ tenant: btn.dataset.tenant, service, note: `Requested access to ${service}` });
+  } else if (btn.dataset.reqService !== undefined) {
+    await submitRequest({ service, note: `Requested access to ${service}` });
+  }
+});
+
+$('catalog-roles').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-req-platform]');
+  if (btn) await submitRequest({ role: btn.dataset.reqPlatform });
+});
+
+// Testing your own access replays your real session token rather than minting
+// an impersonation one, so a stale or revoked session shows the 401 you would
+// actually get instead of a freshly-signed success.
+$('test-mine').addEventListener('click', () => runAccessTest(api, {
+  path: '/me/test-access',
+  title: `Access test — ${state.me.username}`,
+  subtitle: (r) => {
+    const reachable = r.services.reduce((n, s) => n + s.allowedCount, 0);
+    const total = r.services.reduce((n, s) => n + s.totalCount, 0);
+    return `${reachable}/${total} endpoints reachable across ${r.services.length} service(s)`
+      + ` · roles: ${r.roles.filter((x) => !x.startsWith('t:')).join(', ') || 'none'}`;
+  },
+}));
+
+// ══ VIEW: my services (tenant owner) ════════════════════════════════════
+
+async function refreshOwn() {
+  const mine = await api('/tenants/mine');
+  state.ownTenants = mine.tenants.filter((t) => t.isAdmin);
+
+  $('own-card').hidden = state.ownTenants.length === 0;
+  if (!state.ownTenants.length) { $('reg').hidden = false; return; }
+
+  const keep = state.ownTenants.some((t) => t.id === state.currentOwn)
+    ? state.currentOwn : state.ownTenants[0].id;
+  await selectOwn(keep);
+}
+
+async function selectOwn(id) {
+  state.currentOwn = id;
+  if (!ownPanel) {
+    ownPanel = new TenantPanel({
+      mount: $('own-panel'), api, isPlatform: state.me.isPlatformAdmin, onChange: renderOwnHeader,
+    });
+  }
+  await ownPanel.load(id);
+  renderOwnHeader();
+}
+
+function renderOwnHeader() {
+  const t = ownPanel?.state.tenant;
+  if (!t) return;
+  $('own-name').textContent = t.displayName;
+  $('own-hint').innerHTML =
+    `Reachable at <code>/gateway/${esc(t.id)}/…</code> — owner ${t.owner ? esc(t.owner) : '<em>unassigned</em>'}`
+    + (t.admins.length > 1 ? ` · administered by ${t.admins.map(esc).join(', ')}` : '');
+
+  const picker = state.ownTenants.length > 1
+    ? `<select id="own-picker">${state.ownTenants.map((x) => `
+        <option value="${esc(x.id)}" ${x.id === state.currentOwn ? 'selected' : ''}>${esc(x.displayName)}</option>`).join('')}</select>`
+    : '';
+  $('own-meta').innerHTML = picker + badge(t.status, t.status)
+    + (t.service ? badge(t.service.health, `service ${t.service.health}`) : badge('warn', 'no service'));
+  $('own-picker')?.addEventListener('change', (e) => selectOwn(e.target.value));
+}
+
+$('reg-toggle').addEventListener('click', () => { $('reg').hidden = !$('reg').hidden; });
+$('reg-cancel').addEventListener('click', () => { $('reg').hidden = true; });
+
+$('reg').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const d = Object.fromEntries(new FormData(e.target).entries());
+  const body = { name: d.name.trim(), baseUrl: d.baseUrl.trim() };
+  for (const k of ['catalogUrl', 'displayName']) if (d[k]?.trim()) body[k] = d[k].trim();
+  const endpoints = parseList(d.endpoints);
+  if (endpoints.length) body.endpoints = endpoints;
+
+  ok((await api('/tenants/register', { method: 'POST', body })).message);
+  e.target.reset();
+  $('reg').hidden = true;
+  state.currentOwn = body.name;
+  // Registering a first service turns a plain member into an owner, which
+  // changes which views they are entitled to.
+  await enter();
+});
+
+// ══ VIEW: platform ══════════════════════════════════════════════════════
+
+async function refreshPlatform() {
+  await refreshRoles();
+  await Promise.all([refreshTenants(), refreshUsers(), refreshPolicies(), refreshRequests()]);
+}
+
+async function refreshTenants() {
+  const data = await api('/admin/tenants');
+  state.tenants = data.tenants;
+
+  $('tenants').innerHTML = data.tenants.length ? data.tenants.map((t) => `
+    <details class="panel" data-tenant="${esc(t.id)}" ${state.openTenant === t.id ? 'open' : ''}>
+      <summary>
+        <span class="caret">▶</span>
+        <div style="flex:1;min-width:0">
+          <div class="row" style="gap:8px">
+            <strong>${esc(t.displayName)}</strong>
+            <code>${esc(t.id)}</code>
+            ${badge(t.status, t.status)}
+            ${t.service ? badge(t.service.health, t.service.health) : badge('warn', 'no service')}
+          </div>
+          <div class="muted" style="margin-top:3px">${summaryLine(t)}</div>
+        </div>
+        <button class="danger tiny" data-del-tenant="${esc(t.id)}">Delete</button>
+      </summary>
+      <div class="body" data-body="${esc(t.id)}"></div>
+    </details>`).join('')
+    : '<p class="empty">No tenants yet. Register one above — or start a service that registers itself.</p>';
+
+  if (state.openTenant) await openTenant(state.openTenant);
+}
+
+function summaryLine(t) {
+  const s = t.service;
+  return `${s ? `${esc(s.baseUrl)} · ${(s.endpoints || []).length} endpoint(s)` : 'no base URL yet'}
+    · ${t.memberCount} user(s) · ${t.roles.length} role(s)
+    · owner ${t.owner ? esc(t.owner) : '<em>unassigned</em>'}`;
+}
+
+async function openTenant(id) {
+  const host = document.querySelector(`[data-body="${CSS.escape(id)}"]`);
+  if (!host) return;
+  state.openTenant = id;
+  let panel = adminPanels.get(id);
+  if (!panel || panel.mount !== host) {
+    panel = new TenantPanel({
+      mount: host, api, isPlatform: true,
+      onChange: () => { refreshSummaries().catch(() => {}); },
+    });
+    adminPanels.set(id, panel);
+  }
+  await panel.load(id);
+}
+
+/** Redraw just the summary lines, leaving every open panel's DOM alone. */
+async function refreshSummaries() {
+  const data = await api('/admin/tenants');
+  state.tenants = data.tenants;
+  for (const t of data.tenants) {
+    const el = document.querySelector(`details[data-tenant="${CSS.escape(t.id)}"] summary .muted`);
+    if (el) el.innerHTML = summaryLine(t);
+  }
+}
+
+$('tenants').addEventListener('toggle', async (e) => {
+  const d = e.target.closest('details[data-tenant]');
+  if (!d) return;
+  if (d.open) {
+    document.querySelectorAll('details[data-tenant][open]').forEach((o) => { if (o !== d) o.open = false; });
+    await openTenant(d.dataset.tenant);
+  } else if (state.openTenant === d.dataset.tenant) {
+    state.openTenant = null;
+  }
+}, true);
+
+$('tenants').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-del-tenant]');
+  if (!btn) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const id = btn.dataset.delTenant;
+  // A registered service IS a tenant, so dropping the tenant alone is a reset:
+  // the sync tick provisions a blank one straight back.
+  const alsoDeregister = confirmDanger(
+    `Tenant '${id}'\n\n`
+    + 'OK     — delete it and deregister its service (it stops being routable)\n'
+    + 'Cancel — reset it only: roles, policies and members are wiped, then a blank tenant '
+    + 'is re-provisioned because the service stays registered');
+  ok((await api(`/admin/tenants/${encodeURIComponent(id)}${alsoDeregister ? '?deregister=true' : ''}`,
+    { method: 'DELETE' })).message);
+  adminPanels.delete(id);
+  if (state.openTenant === id) state.openTenant = null;
+  await refreshTenants();
+});
+
+$('new-tenant-toggle').addEventListener('click', () => { $('new-tenant').hidden = !$('new-tenant').hidden; });
+$('new-tenant-cancel').addEventListener('click', () => { $('new-tenant').hidden = true; });
+
+$('new-tenant').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const d = Object.fromEntries(new FormData(e.target).entries());
+  const body = { id: d.id.trim() };
+  for (const k of ['displayName', 'baseUrl', 'catalogUrl', 'owner', 'version']) {
+    if (d[k]?.trim()) body[k] = d[k].trim();
+  }
+  const endpoints = parseList(d.endpoints);
+  if (endpoints.length) body.endpoints = endpoints;
+
+  ok((await api('/admin/tenants', { method: 'POST', body })).message);
+  e.target.reset();
+  $('new-tenant').hidden = true;
+  state.openTenant = body.id;
+  await refreshTenants();
+});
+
+async function refreshUsers() {
+  const data = await api('/admin/users');
+  $('users').innerHTML = data.users.map((u) => {
+    const platform = u.roles.filter((r) => !r.startsWith('t:'));
+    const tenantCount = u.roles.length - platform.length;
+    return `
+      <tr>
+        <td class="mono">${esc(u.username)}</td>
+        <td>${badge(u.role === 'admin' ? 'info' : 'plain', u.role)}</td>
+        <td>${chips(platform) || '<span class="muted">none</span>'}
+          ${tenantCount ? `<span class="muted">+ ${tenantCount} tenant role(s)</span>` : ''}</td>
+        <td class="nowrap">
+          <button class="ghost tiny" data-reset="${esc(u.username)}">Reset password</button>
+          <button class="danger tiny" data-del-user="${esc(u.username)}">Delete</button>
+        </td>
+      </tr>`;
+  }).join('');
+}
+
+$('users').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  if (btn.dataset.delUser) {
+    if (!confirmDanger(`Delete account '${btn.dataset.delUser}'?\n\nThey are removed from every tenant. This cannot be undone.`)) return;
+    ok((await api(`/admin/users/${encodeURIComponent(btn.dataset.delUser)}`, { method: 'DELETE' })).message);
+  } else if (btn.dataset.reset) {
+    const pw = window.prompt(`New password for '${btn.dataset.reset}'? All their sessions will be invalidated.`);
+    if (!pw) return;
+    ok((await api(`/admin/users/${encodeURIComponent(btn.dataset.reset)}/reset-password`,
+      { method: 'POST', body: { newPassword: pw } })).message);
+    return;
+  } else return;
+  await Promise.all([refreshUsers(), refreshTenants()]);
+});
+
+async function refreshRequests() {
+  const f = $('req-filter').value;
+  const data = await api(`/admin/requests${f ? `?status=${encodeURIComponent(f)}` : ''}`);
+  const platform = data.requests.filter((r) => !r.tenant);
+  const roleOptions = state.roles.map((r) => `<option value="${esc(r.role)}">${esc(r.role)}</option>`).join('');
+
+  $('requests').innerHTML = platform.length ? platform.map((r) => `
+    <tr>
+      <td class="mono">${esc(r.username)}<div class="muted">${esc(relTime(r.requestedAt))}</div></td>
+      <td>${r.role ? `<span class="chip navy">${esc(r.role)}</span>` : `<span class="muted">${esc(r.service || '—')}</span>`}</td>
+      <td class="muted">${esc(r.note || '')}</td>
+      <td>${badge(r.status, r.status)}${r.resolvedBy ? `<div class="muted">by ${esc(r.resolvedBy)}</div>` : ''}</td>
+      <td class="nowrap">${r.status === 'pending' ? `
+        <div class="row">
+          <select data-approve-for="${esc(r.id)}">
+            ${r.role ? `<option value="${esc(r.role)}">${esc(r.role)}</option>` : '<option value="">pick a role…</option>'}
+            ${roleOptions}
+          </select>
+          <button class="tiny" data-approve="${esc(r.id)}">Approve</button>
+          <button class="danger tiny" data-reject="${esc(r.id)}">Reject</button>
+        </div>` : ''}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="5" class="empty">No platform-level requests.</td></tr>';
+}
+
+$('req-filter').addEventListener('change', refreshRequests);
+
+$('requests').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  if (btn.dataset.approve) {
+    const sel = document.querySelector(`select[data-approve-for="${CSS.escape(btn.dataset.approve)}"]`);
+    if (!sel.value) return err('Pick a role to approve with');
+    ok((await api(`/admin/requests/${encodeURIComponent(btn.dataset.approve)}/approve`,
+      { method: 'POST', body: { role: sel.value } })).message);
+  } else if (btn.dataset.reject) {
+    ok((await api(`/admin/requests/${encodeURIComponent(btn.dataset.reject)}/reject`, { method: 'POST' })).message);
+  } else return;
+  await Promise.all([refreshRequests(), refreshUsers()]);
+});
+
+async function refreshRoles() {
+  const data = await api('/admin/roles');
+  state.roles = data.roles;
+  $('roles').innerHTML = data.roles.map((r) => `
+    <tr><td class="mono">${esc(r.role)}</td><td>${r.users.length}</td></tr>`).join('');
+}
+
+$('new-role').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  ok((await api('/admin/roles/define',
+    { method: 'POST', body: { role: new FormData(e.target).get('role').trim() } })).message);
+  e.target.reset();
+  await refreshRoles();
+});
+
+async function refreshPolicies() {
+  const data = await api('/admin/policies');
+  const platform = data.policies.filter((p) => !p.subject.startsWith('t:'));
+  $('policies').innerHTML = platform.length ? platform.map((p) => `
+    <tr>
+      <td class="mono">${esc(p.subject)}</td>
+      <td><code>${esc(p.resource)}</code></td>
+      <td><span class="badge info plain">${esc(p.action)}</span></td>
+      <td><button class="danger tiny" data-p='${esc(JSON.stringify(p))}'>Remove</button></td>
+    </tr>`).join('')
+    : '<tr><td colspan="4" class="empty">No platform-level policies.</td></tr>';
+}
+
+$('policies').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-p]');
+  if (!btn) return;
+  ok((await api('/admin/policies', { method: 'DELETE', body: JSON.parse(btn.dataset.p) })).message);
+  await refreshPolicies();
+});
+
+$('new-policy').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const d = Object.fromEntries(new FormData(e.target).entries());
+  ok((await api('/admin/policies', {
+    method: 'POST',
+    body: { subject: d.subject.trim(), resource: d.resource.trim(), action: d.action.trim().toLowerCase() },
+  })).message);
+  e.target.reset();
+  await refreshPolicies();
+});
+
+// ── boot ────────────────────────────────────────────────────────────────
+
+$('go').addEventListener('click', submitAuth);
+$('p').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAuth(); });
+$('u').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('p').focus(); });
+
+// A stored token is only a hint — the server decides whether it is still good.
+if (sess.token) enter().catch(() => { sess.token = null; });
+</script>
+
+</body>
+</html>

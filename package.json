@@ -1,0 +1,39 @@
+{
+  "name": "ls",
+  "version": "1.0.0",
+  "description": "Multi-tenant IAM API gateway with Casbin RBAC, dynamic service discovery, and per-tenant self-governance",
+  "license": "ISC",
+  "author": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "./start.sh",
+    "stop": "./start.sh stop",
+    "restart": "./start.sh restart",
+    "status": "./start.sh status",
+    "e2e": "node src/e2e.test.js",
+    "check:endpoints": "node src/endpoint-check.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "check:ui": "node src/ui-check.js",
+    "check": "node src/endpoint-check.js && node src/ui-check.js"
+  },
+  "dependencies": {
+    "argon2": "^0.45.1",
+    "bcrypt": "^6.0.0",
+    "casbin": "^5.51.1",
+    "casbin-redis-adapter": "^1.0.4",
+    "express": "^5.2.1",
+    "http-proxy-middleware": "^3.0.7",
+    "ioredis": "^5.11.1",
+    "jsonwebtoken": "^9.0.3",
+    "node-fetch": "^3.3.2",
+    "redis": "^6.1.0",
+    "swagger-jsdoc": "^6.3.0",
+    "swagger-ui-express": "^5.0.1"
+  },
+  "devDependencies": {
+    "jest": "^30.4.2",
+    "supertest": "^7.2.2"
+  }
+}

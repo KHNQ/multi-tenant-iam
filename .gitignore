@@ -1,0 +1,11 @@
+node_modules/
+logs/
+.run/
+src/loadtest/.state/
+src/loadtest/.results/
+*.log
+npm-debug.log*
+.DS_Store
+
+# redis snapshot written into the repo root when redis-server is started here
+dump.rdb
