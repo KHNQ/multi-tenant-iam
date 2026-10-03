@@ -8,7 +8,15 @@
  *                                         correlating a request across
  *                                         the gateway + registry + a
  *                                         downstream service)
- * and mirrored to the console for local dev visibility.
+ * and mirrored to the console for local dev visibility. Security-relevant
+ * entries are also shipped off the host as they happen, if a collector is
+ * configured (log-forwarder.js).
+ *
+ * Every entry written while a request is being handled carries that
+ * request's id, the address it came from and — once it has authenticated —
+ * the account making it, without each call site having to pass them along.
+ * That is what turns "a role was revoked" into a record of who revoked it,
+ * from where, as part of which request.
  *
  * No log4j/winston/pino dependency: at this scale (a handful of
  * processes, JSON lines, daily files) an external logging library
@@ -18,6 +26,21 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
+const { createLogForwarderFromEnv } = require('./log-forwarder');
+
+// One per process, shared by every logger in it.
+const forwarder = createLogForwarderFromEnv();
+
+// What is known about the request currently being handled. Entered by
+// requestLogger(), so it covers everything that runs downstream of it.
+const requestContext = new AsyncLocalStorage();
+
+// A caller may supply a request id so one operation can be followed across
+// systems — but only something that is plainly an id, never free text that
+// would end up in every log line.
+const REQUEST_ID = /^[A-Za-z0-9._-]{8,64}$/;
 
 const LOG_DIR = process.env.LOG_DIR || path.join(__dirname, '..', 'logs');
 fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -53,12 +76,18 @@ function consoleMirror(entry) {
  */
 function createLogger(serviceName) {
   function log(level, category, message, meta = {}) {
+    const request = requestContext.getStore();
     const entry = {
       ts: new Date().toISOString(),
       level,
       service: serviceName,
       category,
       message,
+      ...(request ? {
+        requestId: request.requestId,
+        ip: request.ip,
+        ...(request.actor ? { actorId: request.actor.id, actor: request.actor.username } : {}),
+      } : {}),
       ...meta,
     };
 
@@ -66,6 +95,7 @@ function createLogger(serviceName) {
     const line = JSON.stringify(entry);
     appendLine(`${serviceName}-${dateStamp()}.log`, line);
     appendLine(`combined-${dateStamp()}.log`, line);
+    if (forwarder) forwarder.push(entry);
 
     return entry;
   }
@@ -80,23 +110,46 @@ function createLogger(serviceName) {
     // consumers can filter for "what did someone do" vs "what happened".
     audit: (category, message, meta) => log('audit', category, message, meta),
 
-    /** Express middleware: logs every request/response with timing. */
+    /**
+     * Records which account the current request has authenticated as, so the
+     * entries that follow say who did the thing they describe.
+     */
+    setActor(actor) {
+      const request = requestContext.getStore();
+      if (request) request.actor = { id: actor.id, username: actor.username };
+    },
+
+    /** Counters for the log forwarder, or null if nothing is being forwarded. */
+    forwarderStats: () => (forwarder ? forwarder.stats() : null),
+
+    /**
+     * Express middleware: logs every request/response with timing, and opens
+     * the request's logging context. Mount it after the body parser — a
+     * context entered before the body has been read is lost when the stream's
+     * events fire.
+     */
     requestLogger() {
       return (req, res, next) => {
+        const supplied = req.get('X-Request-Id');
+        const requestId = supplied && REQUEST_ID.test(supplied) ? supplied : crypto.randomUUID();
+        res.setHeader('X-Request-Id', requestId);
+
+        const context = { requestId, ip: req.ip };
         const startedAt = process.hrtime.bigint();
         res.on('finish', () => {
           const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
           const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
-          log(level, 'http', `${req.method} ${req.originalUrl} -> ${res.statusCode}`, {
+          // 'finish' fires outside the request's async context; re-enter it so
+          // this line carries the same id and actor as the rest.
+          requestContext.run(context, () => log(level, 'http', `${req.method} ${req.originalUrl} -> ${res.statusCode}`, {
             method: req.method,
             path: req.originalUrl,
             status: res.statusCode,
             durationMs: Math.round(durationMs * 100) / 100,
-            ip: req.ip,
             user: req.user?.username,
-          });
+          }));
         });
-        next();
+        requestContext.run(context, next);
       };
     },
   };

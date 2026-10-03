@@ -2,16 +2,21 @@
  * The access-test inspector.
  * ───────────────────────────────────────────────────────────────────────────
  * "Did the role I just granted actually work?" is the question this whole
- * system exists to answer, so the test shows the entire exchange rather than a
- * green tick: the token that was presented and its decoded claims, the request
- * as it went out, and the status, headers and body that came back.
+ * system exists to answer. The server answers it in one of two ways, and says
+ * which in `result.mode`:
  *
- * The probe runs server-side over loopback through the gateway's own
- * /gateway routes, so what is displayed is the real
- * authenticate -> enforce -> proxy path, not a re-reading of the policy table.
+ *   live-call           testing YOURSELF ("My access"). Your own token is
+ *                       replayed through the gateway's /gateway routes, so the
+ *                       whole exchange is shown: the claims the gateway read,
+ *                       the request as it went out, and the status, headers
+ *                       and body that came back.
  *
- * Shared by the tenant panel (testing a member) and the console's own
- * "My access" view (testing yourself).
+ *   policy-evaluation   testing SOMEONE ELSE (the tenant panel). The gateway
+ *                       asks its own authorization function and reports the
+ *                       decision and what granted or stopped it. No token is
+ *                       issued for the other account and no service is
+ *                       called, so there is no exchange to show — and no
+ *                       credential for the tester to end up holding.
  */
 
 import { esc, badge } from './app.js';
@@ -47,7 +52,7 @@ function renderHeaders(headers) {
     <dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>`;
 }
 
-/** The token panel — claims in full, the signature deliberately not. */
+/** The token panel. Only ever the viewer's own token (live-call mode). */
 function renderToken(t) {
   if (!t) return '';
   return `
@@ -57,7 +62,7 @@ function renderToken(t) {
         <div style="flex:1;min-width:0">
           <div class="row" style="gap:8px">
             <strong>Bearer token</strong>
-            ${t.masked ? badge('warn', 'masked') : badge('info', 'your own')}
+            ${badge('info', 'your own')}
             ${t.expiresInSeconds !== null ? `<span class="muted">expires in ${t.expiresInSeconds}s</span>` : ''}
           </div>
           <div class="muted mono" style="margin-top:3px;word-break:break-all">${esc(t.value)}</div>
@@ -129,16 +134,57 @@ function renderEndpoint(ep) {
     </details>`;
 }
 
+/** Why the gateway would let a call through: the policy row, or the bypass role. */
+function renderGrant(g) {
+  if (!g) return '';
+  return g.bypass
+    ? `Allowed because the account holds <strong>${esc(g.bypass)}</strong>, which bypasses policy.`
+    : `Allowed by <strong>${esc(g.subject)}</strong> — <code>${esc(g.action)} ${esc(g.resource)}</code>.`;
+}
+
+/** One endpoint of a policy evaluation: the decision and its reason, nothing sent. */
+function renderDecision(ep) {
+  const state = STATE[ep.decision] || 'warn';
+  const label = ep.decision === 'allowed' ? 'would be allowed'
+    : `${ep.status} ${ep.decision === 'denied' ? 'would be denied' : 'cannot be routed'}`;
+  const why = ep.decision === 'allowed' ? renderGrant(ep.grantedBy) : esc(ep.explanation || ep.error || '');
+
+  return `
+    <details class="panel">
+      <summary>
+        <span class="caret">▶</span>
+        <div style="flex:1;min-width:0">
+          <div class="row" style="gap:8px">
+            <code>${esc(ep.endpoint)}</code>
+            ${badge(state, label)}
+          </div>
+          ${ep.stoppedBy ? `<div class="muted" style="margin-top:3px">stopped at <strong>${esc(ep.stoppedBy)}</strong></div>` : ''}
+        </div>
+      </summary>
+      <div class="body">
+        <div class="sub">
+          <h3>Why</h3>
+          <p class="muted" style="margin:0;font-size:12.5px">${why}</p>
+        </div>
+      </div>
+    </details>`;
+}
+
 function renderResult(result) {
   const services = result.services || [];
   if (!services.length) return '<p class="empty">No services with endpoints to test against.</p>';
 
-  return renderToken(result.token) + services.map((svc) => `
+  const evaluated = result.mode === 'policy-evaluation';
+  const head = evaluated
+    ? `<p class="muted" style="margin:0 0 12px;font-size:12.5px">${esc(result.note || '')}</p>`
+    : renderToken(result.token);
+
+  return head + services.map((svc) => `
     <div class="sub">
-      <h3>${esc(svc.service)} — ${svc.allowedCount}/${svc.totalCount} reachable
+      <h3>${esc(svc.service)} — ${svc.allowedCount}/${svc.totalCount} ${evaluated ? 'permitted' : 'reachable'}
         ${svc.baseUrl ? `<span class="muted" style="text-transform:none;letter-spacing:0"> · ${esc(svc.baseUrl)}</span>` : ''}</h3>
       ${svc.endpoints.length
-        ? svc.endpoints.map(renderEndpoint).join('')
+        ? svc.endpoints.map(evaluated ? renderDecision : renderEndpoint).join('')
         : '<p class="empty">No endpoints declared.</p>'}
     </div>`).join('');
 }
@@ -157,7 +203,7 @@ export async function runAccessTest(api, { path, title, subtitle }) {
   const set = (sel, text) => { modal.querySelector(sel).textContent = text; };
 
   set('[data-test-title]', title);
-  set('[data-test-sub]', 'Calling every endpoint and recording the whole exchange…');
+  set('[data-test-sub]', 'Checking every endpoint…');
   modal.querySelector('[data-test-body]').innerHTML = '';
   modal.classList.add('on');
 

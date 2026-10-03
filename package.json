@@ -16,7 +16,12 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "check:ui": "node src/ui-check.js",
-    "check": "node src/endpoint-check.js && node src/ui-check.js"
+    "check": "node src/endpoint-check.js && node src/ui-check.js",
+    "backup": "node src/backup/redis-backup.js backup",
+    "backup:keygen": "node src/backup/redis-backup.js keygen",
+    "backup:verify": "node src/backup/redis-backup.js verify",
+    "backup:drill": "node src/backup/redis-backup.js drill",
+    "backup:selftest": "node src/backup/selftest.js"
   },
   "dependencies": {
     "argon2": "^0.45.1",

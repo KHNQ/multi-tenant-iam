@@ -8,12 +8,17 @@
  * so re-runs with the same --seed reproduce the same distribution).
  *
  * Prerequisite: registry + gateway + mock-services.js all running, with the
- * bench fleet already registered (mock-services.js registers itself).
+ * bench fleet already registered (mock-services.js registers itself). The
+ * gateway limits signups per client address and requests per account, and
+ * seeding 1000 accounts is far over both. Start it for load testing with:
+ *   SIGNUP_MAX_PER_MINUTE=1000000 API_REQUESTS_PER_MINUTE=1000000 \
+ *     GATEWAY_REQUESTS_PER_MINUTE=1000000 ./start.sh restart
  *
- * Run with: node src/loadtest/seed.js [--users=1000] [--tiers=10] [--seed=1337]
+ * Run with: ADMIN_PASSWORD=<platform admin password> node src/loadtest/seed.js [--users=1000] [--tiers=10] [--seed=1337]
  * Writes:   src/loadtest/.state/state.json
  */
 
+require('../local-env'); // .env, when run by hand
 const fs = require('fs');
 const path = require('path');
 const { makeRng } = require('./lib/rng');
@@ -50,8 +55,11 @@ function fmtSecs(ms) {
 }
 
 async function adminLogin() {
+  if (!process.env.ADMIN_PASSWORD) {
+    throw new Error('ADMIN_PASSWORD is not set — the gateway has no default admin password to fall back on');
+  }
   const res = await timedRequest('POST', `${CONFIG.gateway}/auth/login`, {
-    body: { username: 'admin', password: 'adminpass' },
+    body: { username: process.env.ADMIN_USERNAME || 'admin', password: process.env.ADMIN_PASSWORD },
     agent,
   });
   if (res.status !== 200) {
@@ -140,6 +148,13 @@ async function signupUser(username, password) {
   const res = await timedRequest('POST', `${CONFIG.gateway}/auth/signup`, {
     body: { username, password }, agent,
   });
+  if (res.status === 429) {
+    throw new Error(
+      `Signup rate limit hit while creating ${username}. Seeding creates ${CONFIG.userCount} accounts from one address, `
+      + 'far more than the gateway allows per minute. Start the gateway for load testing with its limits raised: '
+      + 'SIGNUP_MAX_PER_MINUTE=1000000 API_REQUESTS_PER_MINUTE=1000000 GATEWAY_REQUESTS_PER_MINUTE=1000000 ./start.sh restart',
+    );
+  }
   // 409 = already exists from a previous seed run; treat as success (idempotent re-seed)
   if (res.status !== 201 && res.status !== 409) {
     throw new Error(`Signup failed for ${username}: ${res.status} ${JSON.stringify(res.body)}`);
@@ -327,5 +342,11 @@ async function main() {
 
 main().catch((err) => {
   console.error(`\n[seed] FATAL: ${err.message}`);
+  if (/\b429\b/.test(err.message)) {
+    // Seeding is thousands of admin calls and signups from one account and
+    // one address in a few seconds — exactly what the limits exist to stop.
+    console.error('[seed] That is the gateway\'s rate limiting. For load testing, start it with the limits raised:');
+    console.error('[seed]   SIGNUP_MAX_PER_MINUTE=1000000 API_REQUESTS_PER_MINUTE=1000000 GATEWAY_REQUESTS_PER_MINUTE=1000000 ./start.sh restart');
+  }
   process.exit(1);
 });

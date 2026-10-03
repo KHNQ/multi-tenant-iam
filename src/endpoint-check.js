@@ -17,17 +17,31 @@
  * reported failure, and the coverage number cannot quietly drift.
  *
  * Prerequisites: the whole stack up (./start.sh).
- * Run: node src/endpoint-check.js
+ * Run: ADMIN_PASSWORD=<platform admin password> node src/endpoint-check.js
  */
 
+require('./local-env'); // .env, when run by hand
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
-const { randomUUID } = require('crypto');
+const { randomUUID, randomBytes, createHash } = require('crypto');
 
 const GATEWAY = process.env.GATEWAY_URL || 'http://localhost:3000';
 const REGISTRY = process.env.REGISTRY_URL || 'http://localhost:3001';
-const ADMIN = { username: 'admin', password: process.env.ADMIN_PASSWORD || 'adminpass' };
+const ADMIN = { username: process.env.ADMIN_USERNAME || 'admin', password: process.env.ADMIN_PASSWORD };
+
+// What the registry was started with; needed to register the throwaway service
+// the registry probes use (it creates records only for authenticated callers).
+const ENROLLMENT_TOKEN = process.env.REGISTRY_ENROLLMENT_TOKEN;
+
+if (!ADMIN.password) {
+  console.error('ADMIN_PASSWORD is not set. Run as:  ADMIN_PASSWORD=<platform admin password> npm run check:endpoints   (or put it in .env)');
+  process.exit(1);
+}
+if (!ENROLLMENT_TOKEN) {
+  console.error('REGISTRY_ENROLLMENT_TOKEN is not set. It is the value the registry was started with — normally in .env, which this check reads.');
+  process.exit(1);
+}
 
 const C = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
@@ -36,10 +50,12 @@ const C = {
 
 // ─── HTTP ────────────────────────────────────────────────────────────────────
 
-function request(method, url, { body, token, headers = {}, timeout = 8000 } = {}) {
+function request(method, url, { body, form, token, headers = {}, timeout = 8000 } = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
-    const payload = body === undefined ? undefined : JSON.stringify(body);
+    // `form` sends application/x-www-form-urlencoded — what the OIDC endpoints take.
+    const payload = form ? new URLSearchParams(form).toString()
+      : body === undefined ? undefined : JSON.stringify(body);
 
     const req = http.request({
       hostname: parsed.hostname,
@@ -47,7 +63,7 @@ function request(method, url, { body, token, headers = {}, timeout = 8000 } = {}
       path: parsed.pathname + parsed.search,
       method,
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type': form ? 'application/x-www-form-urlencoded' : 'application/json',
         ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...headers,
@@ -138,6 +154,15 @@ async function signupAndLogin(prefix) {
   return { username, password, token: login.body.token };
 }
 
+/**
+ * Taking access away from an account ends its sessions, so a probe that does
+ * that has to sign the account back in before the next probe uses it.
+ */
+async function freshToken(username, password) {
+  const login = await request('POST', `${GATEWAY}/auth/login`, { body: { username, password } });
+  return login.body.token;
+}
+
 // A tiny stand-in service so the tenant under test has something real to
 // front — a probe of /gateway that can only ever 502 proves nothing.
 function startFixtureService(port, name) {
@@ -187,7 +212,7 @@ async function run() {
   const outsider = await signupAndLogin('epc_outsider');
   Object.assign(S, {
     ownerUser: owner.username, ownerToken: owner.token,
-    memberUser: member.username, memberToken: member.token,
+    memberUser: member.username, memberToken: member.token, memberPassword: member.password,
     outsiderUser: outsider.username, outsiderToken: outsider.token,
   });
 
@@ -199,16 +224,25 @@ async function run() {
   await probe('GET /services/:name', 'registry single service',
     () => request('GET', `${REGISTRY}/services/llm`), [200, 404]);
   await probe('POST /register', 'register a service with no reachable catalog (used to be a hard 502)',
-    () => {
+    async () => {
       const name = `epcoffline${Math.floor(Math.random() * 100000)}`;
-      S.createdServices.push(name);
       S.createdTenants.push(name); // the gateway provisions a tenant for it on sync
-      return request('POST', `${REGISTRY}/register`, { body: { name, baseUrl: 'http://localhost:9999' } });
+      const res = await request('POST', `${REGISTRY}/register`, {
+        body: { name, baseUrl: 'http://localhost:9999' }, headers: { 'X-Enrollment-Token': ENROLLMENT_TOKEN },
+      });
+      // Issued once. Without it this check could never clean the record up.
+      S.createdServices.push({ name, token: res.body?.serviceToken });
+      return res;
     }, [201]);
-  await probe('PATCH /services/:name', 'registry rejects a metadata edit with no service token',
+  await probe('POST /services/:name/heartbeat', 'a service renews its registration with its token',
+    () => {
+      const { name, token } = S.createdServices[0];
+      return request('POST', `${REGISTRY}/services/${name}/heartbeat`, { headers: { 'X-Service-Token': token } });
+    }, [200]);
+  await probe('PATCH /services/:name', 'registry rejects a configuration edit with no service token',
     () => request('PATCH', `${REGISTRY}/services/llm`, { body: { version: 'nope' } }), [403, 404]);
-  await probe('DELETE /services/:name', 'deregister an unknown service 404s',
-    () => request('DELETE', `${REGISTRY}/services/epcheck_missing_xyz`), [404]);
+  await probe('DELETE /services/:name', 'registry refuses to deregister a service for someone who does not own it',
+    () => request('DELETE', `${REGISTRY}/services/${S.createdServices[0].name}`), [403]);
   await probe('GET /docs.json', 'registry OpenAPI spec',
     () => request('GET', `${REGISTRY}/docs.json`), [200]);
   await probe('USE /docs', 'registry swagger UI',
@@ -263,7 +297,16 @@ async function run() {
     () => request('POST', `${GATEWAY}/tenants/${S.tenantId}/users/${S.memberUser}/admin`, { token: S.ownerToken }), [200]);
   await probe('DELETE /tenants/:tenantId/users/:username/admin', 'demote them again',
     () => request('DELETE', `${GATEWAY}/tenants/${S.tenantId}/users/${S.memberUser}/admin`, { token: S.ownerToken }), [200]);
-  await probe('POST /tenants/:tenantId/users/:username/test-access', 'tenant-scoped access test',
+  await probe('PUT /tenants/:tenantId/users/:username/permissions', 'delegate one part of administering the tenant, then take it back',
+    async () => {
+      const url = `${GATEWAY}/tenants/${S.tenantId}/users/${S.memberUser}/permissions`;
+      const given = await request('PUT', url, { token: S.ownerToken, body: { permissions: ['policies'] } });
+      if (given.status !== 200) return given;
+      return request('PUT', url, { token: S.ownerToken, body: { permissions: [] } });
+    }, [200]);
+  // Revoking a role and removing admin rights both ended the member's sessions.
+  S.memberToken = await freshToken(S.memberUser, S.memberPassword);
+  await probe('POST /tenants/:tenantId/users/:username/test-access', 'tenant-scoped access test (evaluated, no token issued)',
     () => request('POST', `${GATEWAY}/tenants/${S.tenantId}/users/${S.memberUser}/test-access`, { token: S.ownerToken }), [200]);
 
   // ── the point of all of it: the proxy ─────────────────────────────────────
@@ -320,6 +363,24 @@ async function run() {
       const u = await signupAndLogin('epc_out');
       return request('POST', `${GATEWAY}/auth/logout`, { token: u.token });
     }, [200]);
+  await probe('POST /auth/logout-all', 'signing out everywhere ends every session of the account',
+    async () => {
+      const u = await signupAndLogin('epc_outall');
+      const other = await freshToken(u.username, u.password);
+      const res = await request('POST', `${GATEWAY}/auth/logout-all`, { token: u.token });
+      if (res.status !== 200) return res;
+      const after = await request('GET', `${GATEWAY}/me`, { token: other });
+      return after.status === 401 ? res : { status: 500, body: { error: `the other session still answers ${after.status}` } };
+    }, [200]);
+  await probe('POST /auth/password-recovery', 'asking for recovery answers the same for any name',
+    async () => {
+      const real = await request('POST', `${GATEWAY}/auth/password-recovery`, { body: { username: S.memberUser } });
+      const ghost = await request('POST', `${GATEWAY}/auth/password-recovery`, { body: { username: `epc_ghost_${randomUUID().slice(0, 8)}` } });
+      if (real.status !== ghost.status || JSON.stringify(real.body) !== JSON.stringify(ghost.body)) {
+        return { status: 500, body: { error: 'the answer differs between a real and an unknown account' } };
+      }
+      return real;
+    }, [202]);
 
   // ── platform admin ────────────────────────────────────────────────────────
   await probe('GET /admin/users', 'platform user list',
@@ -361,6 +422,50 @@ async function run() {
       const u = await signupAndLogin('epc_reset');
       return request('POST', `${GATEWAY}/admin/users/${u.username}/reset-password`, { token: S.adminToken, body: { newPassword: 'checkpass789' } });
     }, [200]);
+  await probe('POST /admin/users/:username/suspend', 'admin suspends an account',
+    async () => {
+      const u = await signupAndLogin('epc_susp');
+      S.suspendedUser = u.username;
+      return request('POST', `${GATEWAY}/admin/users/${u.username}/suspend`, { token: S.adminToken });
+    }, [200]);
+  await probe('POST /admin/users/:username/reactivate', 'admin reactivates it',
+    async () => {
+      const res = await request('POST', `${GATEWAY}/admin/users/${S.suspendedUser}/reactivate`, { token: S.adminToken });
+      await request('DELETE', `${GATEWAY}/admin/users/${S.suspendedUser}`, { token: S.adminToken });
+      return res;
+    }, [200]);
+  await probe('POST /admin/users/:username/revoke-sessions', 'admin ends every session of an account',
+    async () => {
+      const u = await signupAndLogin('epc_revoke');
+      const res = await request('POST', `${GATEWAY}/admin/users/${u.username}/revoke-sessions`, { token: S.adminToken });
+      if (res.status !== 200) return res;
+      const after = await request('GET', `${GATEWAY}/me`, { token: u.token });
+      return after.status === 401 ? res : { status: 500, body: { error: `the session still answers ${after.status}` } };
+    }, [200]);
+  await probe('POST /admin/users/:username/recovery-link', 'admin issues a one-time recovery link',
+    async () => {
+      const u = await signupAndLogin('epc_recover');
+      S.recovering = u;
+      const res = await request('POST', `${GATEWAY}/admin/users/${u.username}/recovery-link`, { token: S.adminToken });
+      S.recoveryToken = res.status === 200 ? new URL(res.body.link).hash.replace('#recover=', '') : null;
+      return res;
+    }, [200]);
+  await probe('POST /auth/password-recovery/complete', 'the link sets a new password once, and only once',
+    async () => {
+      const complete = () => request('POST', `${GATEWAY}/auth/password-recovery/complete`, {
+        body: { token: S.recoveryToken, newPassword: 'recovered-pass-1' },
+      });
+      const first = await complete();
+      if (first.status !== 200) return first;
+      const again = await complete();
+      if (again.status !== 400) return { status: 500, body: { error: `the same link worked twice (${again.status})` } };
+      const login = await request('POST', `${GATEWAY}/auth/login`, { body: { username: S.recovering.username, password: 'recovered-pass-1' } });
+      return login.status === 200 ? first : login;
+    }, [200]);
+  await probe('PUT /admin/users/:username/attributes', 'admin sets the attributes conditions are evaluated against',
+    () => request('PUT', `${GATEWAY}/admin/users/${S.recovering.username}/attributes`, {
+      token: S.adminToken, body: { attributes: { department: 'radiology', clearance: 2 } },
+    }), [200]);
   await probe('POST /admin/users/:username/test-access', 'admin-wide access test',
     () => request('POST', `${GATEWAY}/admin/users/${S.memberUser}/test-access`, { token: S.adminToken }), [200]);
   await probe('DELETE /admin/users/:username', 'admin deletes an account',
@@ -407,6 +512,94 @@ async function run() {
     () => request('DELETE', `${GATEWAY}/tenants/${S.tenantId}/roles/writer`, { token: S.ownerToken }), [200]);
   await probe('DELETE /tenants/:tenantId/users/:username', 'remove a member',
     () => request('DELETE', `${GATEWAY}/tenants/${S.tenantId}/users/${S.memberUser}`, { token: S.ownerToken }), [200]);
+
+  // ── OpenID Connect ────────────────────────────────────────────────────────
+  // One sign-in, walked end to end: each probe is one step of the code flow.
+  const oidc = { redirectUri: 'https://epcheck.example.test/callback' };
+  const b64url = (buffer) => Buffer.from(buffer).toString('base64url');
+  oidc.verifier = b64url(randomBytes(48));
+  oidc.challenge = b64url(createHash('sha256').update(oidc.verifier).digest());
+
+  await probe('GET /.well-known/openid-configuration', 'discovery document',
+    async () => {
+      const res = await request('GET', `${GATEWAY}/.well-known/openid-configuration`);
+      if (res.status === 200 && !(res.body.code_challenge_methods_supported || []).includes('S256')) {
+        return { status: 500, body: { error: 'the provider does not advertise PKCE S256' } };
+      }
+      return res;
+    }, [200]);
+  await probe('GET /oauth/jwks', 'signing keys',
+    async () => {
+      const res = await request('GET', `${GATEWAY}/oauth/jwks`);
+      // A private member in here would be the signing key itself.
+      if (res.status === 200 && res.body.keys.some((k) => k.d || k.p || k.q)) {
+        return { status: 500, body: { error: 'the JWKS document contains private key material' } };
+      }
+      return res;
+    }, [200]);
+  await probe('POST /admin/oidc/clients', 'admin registers an application',
+    async () => {
+      const res = await request('POST', `${GATEWAY}/admin/oidc/clients`, {
+        token: S.adminToken, body: { name: 'Endpoint check', redirectUris: [oidc.redirectUri] },
+      });
+      oidc.clientId = res.body.client?.clientId;
+      return res;
+    }, [201]);
+  await probe('GET /admin/oidc/clients', 'registered applications',
+    () => request('GET', `${GATEWAY}/admin/oidc/clients`, { token: S.adminToken }), [200]);
+  await probe('GET /oauth/authorize', 'the sign-in page for a registered application',
+    async () => {
+      const res = await request('GET', `${GATEWAY}/oauth/authorize?${new URLSearchParams({
+        response_type: 'code', client_id: oidc.clientId, redirect_uri: oidc.redirectUri, scope: 'openid',
+        state: 'epc-state', code_challenge: oidc.challenge, code_challenge_method: 'S256',
+      })}`);
+      oidc.request = (res.raw.match(/name="request" value="([^"]+)"/) || [])[1];
+      return res;
+    }, [200]);
+  await probe('POST /oauth/authorize', 'signing in sends the browser back with a code',
+    async () => {
+      const res = await request('POST', `${GATEWAY}/oauth/authorize`, {
+        form: { request: oidc.request, step: 'login', username: S.outsiderUser, password: 'checkpass123' },
+      });
+      oidc.code = res.headers.location ? new URL(res.headers.location).searchParams.get('code') : null;
+      return res;
+    }, [303]);
+  await probe('POST /oauth/token', 'the code and its verifier are exchanged for tokens',
+    async () => {
+      const res = await request('POST', `${GATEWAY}/oauth/token`, {
+        form: {
+          grant_type: 'authorization_code', code: oidc.code, redirect_uri: oidc.redirectUri,
+          client_id: oidc.clientId, code_verifier: oidc.verifier,
+        },
+      });
+      oidc.accessToken = res.body.access_token;
+      return res;
+    }, [200]);
+  await probe('GET /oauth/userinfo', 'who the access token belongs to',
+    async () => {
+      const res = await request('GET', `${GATEWAY}/oauth/userinfo`, { token: oidc.accessToken });
+      if (res.status === 200 && res.body.preferred_username !== S.outsiderUser) {
+        return { status: 500, body: { error: `userinfo names ${res.body.preferred_username}` } };
+      }
+      return res;
+    }, [200]);
+  await probe('DELETE /admin/oidc/clients/:clientId', 'admin removes the application',
+    () => request('DELETE', `${GATEWAY}/admin/oidc/clients/${oidc.clientId}`, { token: S.adminToken }), [200]);
+
+  // ── operations ────────────────────────────────────────────────────────────
+  // Off unless the gateway was started with METRICS_TOKEN; either way it must
+  // never answer someone who does not hold the token.
+  await probe('GET /metrics', 'metrics are closed to anyone without the scrape token',
+    async () => {
+      const anonymous = await request('GET', `${GATEWAY}/metrics`);
+      const asAdmin = await request('GET', `${GATEWAY}/metrics`, { token: S.adminToken });
+      if (asAdmin.status === 200) return { status: 500, body: { error: 'an admin session was accepted as a scrape token' } };
+      if (anonymous.status !== asAdmin.status) return asAdmin;
+      if (!process.env.METRICS_TOKEN || anonymous.status === 404) return anonymous;
+      const scraped = await request('GET', `${GATEWAY}/metrics`, { token: process.env.METRICS_TOKEN });
+      if (scraped.status !== 200) return scraped;
+      return scraped.raw.includes('iam_redis_up') ? anonymous : { status: 500, body: { error: 'the scrape has no iam_redis_up' } };
+    }, [401, 404]);
 
   // ── docs + static UIs ─────────────────────────────────────────────────────
   await probe('GET /docs.json', 'gateway OpenAPI spec',
@@ -462,8 +655,9 @@ async function teardown() {
     await request('DELETE', `${GATEWAY}/admin/tenants/${encodeURIComponent(id)}?deregister=true`, { token: S.adminToken })
       .catch(() => {});
   }
-  for (const name of S.createdServices) {
-    await request('DELETE', `${REGISTRY}/services/${encodeURIComponent(name)}`).catch(() => {});
+  for (const { name, token } of S.createdServices) {
+    await request('DELETE', `${REGISTRY}/services/${encodeURIComponent(name)}`, { headers: { 'X-Service-Token': token } })
+      .catch(() => {});
   }
   for (const username of [S.ownerUser, S.memberUser, S.outsiderUser].filter(Boolean)) {
     await request('DELETE', `${GATEWAY}/admin/users/${encodeURIComponent(username)}`, { token: S.adminToken })

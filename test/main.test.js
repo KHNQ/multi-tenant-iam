@@ -41,10 +41,11 @@ test('IAM API Gateway - Full Scenario Coverage', async (t) => {
   const testUser = `user_${Date.now()}`; // Unique user for this run
 
   await t.test('1. Admin Login', async () => {
-    // Admin was seeded in the main application
+    // There is no built-in admin password: say which platform admin to run as.
+    assert.ok(process.env.ADMIN_PASSWORD, 'set ADMIN_PASSWORD to a platform admin password');
     const { status, data } = await postJSON('/auth/login', {
-      username: 'admin',
-      password: 'adminpass',
+      username: process.env.ADMIN_USERNAME || 'admin',
+      password: process.env.ADMIN_PASSWORD,
     });
     assert.strictEqual(status, 200, 'Admin should be able to login');
     assert.ok(data.token, 'Should receive a JWT token');
@@ -141,7 +142,7 @@ test('IAM API Gateway - Full Scenario Coverage', async (t) => {
       const { status, data } = await postJSON(
         '/admin/policies',
         {
-          subject: testUser, // Granting directly to the user
+          subject: `user:${testUser}`, // Granting directly to the user — a bare name is always a role
           resource: '/analytics/metrics',
           action: 'get',
         },

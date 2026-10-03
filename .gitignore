@@ -9,3 +9,10 @@ npm-debug.log*
 
 # redis snapshot written into the repo root when redis-server is started here
 dump.rdb
+
+# local configuration and secrets (JWT_SECRET etc.) — see .env.example
+.env
+# Backup keys (`npm run backup:keygen` writes here by default) and backups
+backup-keys/
+*.rdb.enc
+*.manifest.json

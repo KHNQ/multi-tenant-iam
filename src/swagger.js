@@ -11,7 +11,8 @@ const spec = {
     version: '1.0.0',
     description:
       'Multi-tenant IAM API Gateway with dynamic service discovery.\n\n' +
-      'Authenticate at /auth/login and pass the JWT as `Authorization: Bearer <token>`.\n\n' +
+      'Authenticate at /auth/login and pass the JWT as `Authorization: Bearer <token>`. ' +
+      'Applications sign people in with OpenID Connect instead (Authorization Code + PKCE; see /.well-known/openid-configuration).\n\n' +
       '**Two levels of administration.** Every registered service is a *tenant* that runs its own ' +
       'roles, policies and user list under `/tenants/{id}/…`; the platform admin handles tenant ' +
       'lifecycle and cross-tenant oversight under `/admin/…`. A tenant admin has full authority ' +
@@ -23,11 +24,13 @@ const spec = {
   ],
   tags: [
     { name: 'Auth',     description: 'Signup and login — no token required' },
+    { name: 'OpenID Connect', description: 'Standard sign-in for applications: Authorization Code flow with PKCE. The gateway is the provider' },
     { name: 'Self-Service', description: 'Any authenticated user — browse the catalog and request roles/services' },
     { name: 'Admin',    description: 'Platform-wide administration and tenant lifecycle — platform admin JWT required' },
     { name: 'Tenants',  description: 'Multi-tenancy — every registered service is a tenant that governs its own roles, policies and users' },
     { name: 'Gateway',  description: 'Proxied downstream calls — JWT + Casbin policy required' },
     { name: 'Registry', description: 'Service Registry API (port 3001)' },
+    { name: 'Operations', description: 'Metrics for a monitoring system' },
   ],
   components: {
     securitySchemes: {
@@ -39,6 +42,22 @@ const spec = {
       },
     },
     schemas: {
+      Condition: {
+        description:
+          'An attribute condition: the policy grants only while it holds. A tree of `all` / `any` / `not` ' +
+          'and comparisons. `attr` is `subject.*` (id, username, attributes set by a platform admin), ' +
+          '`resource.*` (service, path, attributes of the owning tenant), `request.*` (method, ip) or ' +
+          '`env.*` (time, hour, weekday — UTC). `value` is a string, number, boolean, a list of those, ' +
+          'or `{ "ref": "resource.department" }` to compare with another attribute. An absent attribute ' +
+          'satisfies no comparison. At most 5 levels and 40 nodes.',
+        type: 'object',
+        example: {
+          all: [
+            { attr: 'subject.department', op: 'eq', value: { ref: 'resource.department' } },
+            { attr: 'subject.clearance', op: 'gte', value: 2 },
+          ],
+        },
+      },
       Error: {
         type: 'object',
         properties: {
@@ -58,6 +77,13 @@ const spec = {
         properties: {
           token:   { type: 'string', example: 'eyJhbGci...' },
           message: { type: 'string', example: 'Login successful' },
+          mustChangePassword: {
+            type: 'boolean',
+            description:
+              'Present (and true) only when the account still holds a temporary password. ' +
+              'The token then opens nothing except `POST /auth/change-password` and `POST /auth/logout`; ' +
+              'every other route answers 403 with `code: "PASSWORD_CHANGE_REQUIRED"`.',
+          },
         },
       },
       RoleAssignment: {
@@ -76,7 +102,14 @@ const spec = {
         type: 'object',
         required: ['subject', 'resource', 'action'],
         properties: {
-          subject:  { type: 'string', description: 'Role or username', example: 'blue_role' },
+          subject: {
+            type: 'string',
+            description:
+              'A bare name is always a platform ROLE (`blue_role`). A tenant role is `t:{tenant}:{role}`. ' +
+              'To target one account, say so explicitly: `user:{username}`. A username on its own is ' +
+              'never a subject, so an account cannot acquire a role\'s policies by being named after it.',
+            example: 'blue_role',
+          },
           resource: { type: 'string', description: 'URL path pattern', example: '/llm/claude' },
           action: {
             type: 'string',
@@ -162,7 +195,10 @@ const spec = {
       post: {
         tags: ['Auth'],
         summary: 'Register a new user',
-        description: 'Creates a user account with the default `user` role.',
+        description:
+          'Creates a user account with the default `user` role. Usernames are 2-64 characters: ' +
+          'letters, digits, `.`, `_`, `-`, `+` or `@`. Passwords are 8-128 characters. Signups ' +
+          'are rate-limited per client address (429 with `Retry-After`).',
         requestBody: {
           required: true,
           content: {
@@ -192,7 +228,7 @@ const spec = {
             },
           },
           400: {
-            description: 'Missing username or password',
+            description: 'Missing username or password, or a username outside the allowed characters',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           409: {
@@ -209,17 +245,24 @@ const spec = {
         summary: 'Login and receive a JWT',
         description:
           'Returns a signed JWT valid for 24 hours. ' +
-          'Use it as `Authorization: Bearer <token>` on all protected routes.',
+          'Use it as `Authorization: Bearer <token>` on all protected routes.\n\n' +
+          'The token carries the account\'s id (`sub`), its security version and a token id — no ' +
+          'username and no role. Whether the account still exists, is active, and is an admin is ' +
+          'read from the store on every request, so a token never outlives a suspension, a ' +
+          'deletion, or any loss of access.\n\n' +
+          'A failed login always answers `401 Invalid username or password`, whether or not the ' +
+          'username exists, and takes the same time either way. Attempts are limited per address ' +
+          'and per username (existing or not); the limit is taken before the password is checked, ' +
+          'so parallel guesses cannot exceed it.\n\n' +
+          'There is no built-in account password. The initial `admin` account is created once, ' +
+          'the first time the gateway boots against an empty store, with a random one-time password ' +
+          'written to a file on the gateway host; logging in with it returns `mustChangePassword: true`.',
         requestBody: {
           required: true,
           content: {
             'application/json': {
               schema: { $ref: '#/components/schemas/Credentials' },
               examples: {
-                admin: {
-                  summary: 'Admin user (pre-seeded)',
-                  value: { username: 'admin', password: 'adminpass' },
-                },
                 regularUser: {
                   summary: 'Regular user',
                   value: { username: 'alice', password: 'SecurePass123!' },
@@ -238,11 +281,19 @@ const spec = {
             },
           },
           400: {
-            description: 'Missing username or password',
+            description: 'Missing or malformed username or password',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           401: {
-            description: 'Wrong username or password',
+            description: 'Invalid username or password — the same answer for an unknown user and a wrong password',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+          },
+          403: {
+            description: 'The password was correct but the account is suspended (`code: "ACCOUNT_SUSPENDED"`)',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+          },
+          429: {
+            description: 'Too many attempts from this address or for this username; see `Retry-After`',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
         },
@@ -265,6 +316,234 @@ const spec = {
       },
     },
 
+    '/auth/logout-all': {
+      post: {
+        tags: ['Auth'],
+        summary: 'Sign out everywhere',
+        description:
+          'Ends every session of the calling account, on every device, by moving its security ' +
+          'version. The token used for this call stops working too.',
+        security: [{ BearerAuth: [] }],
+        responses: {
+          200: { description: 'Every session ended' },
+          401: { description: 'Missing or invalid token' },
+        },
+      },
+    },
+
+    '/auth/password-recovery': {
+      post: {
+        tags: ['Auth'],
+        summary: 'Ask to recover a forgotten password',
+        description:
+          'Always answers 202 with the same message, immediately, whether or not the account exists. ' +
+          'For a real, active account a single-use link valid for 30 minutes is handed to the ' +
+          'configured notification service (PASSWORD_RECOVERY_WEBHOOK_URL). With none configured ' +
+          'nothing is sent, and a platform admin issues the link instead. Limited per address and per account.',
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: { type: 'object', required: ['username'], properties: { username: { type: 'string' } } } } },
+        },
+        responses: {
+          202: { description: 'Accepted — says nothing about whether the account exists' },
+          400: { description: 'Malformed request' },
+          429: { description: 'Too many requests from this address' },
+        },
+      },
+    },
+
+    '/auth/password-recovery/complete': {
+      post: {
+        tags: ['Auth'],
+        summary: 'Set a new password with a recovery token',
+        description:
+          'The token is the part of the recovery link after `#recover=`. It works once. Setting the ' +
+          'password ends every session of the account.',
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object', required: ['token', 'newPassword'],
+            properties: { token: { type: 'string' }, newPassword: { type: 'string', minLength: 8, maxLength: 128 } },
+          } } },
+        },
+        responses: {
+          200: { description: 'Password changed; sign in with it' },
+          400: { description: 'The token is invalid, expired or already used — or the password is not acceptable' },
+          429: { description: 'Too many attempts from this address' },
+        },
+      },
+    },
+
+    '/.well-known/openid-configuration': {
+      get: {
+        tags: ['OpenID Connect'],
+        summary: 'Discovery document',
+        description: 'What an OIDC client library needs: the issuer, the endpoints below, and what is supported (code flow, PKCE S256, RS256, public clients).',
+        responses: { 200: { description: 'OpenID Provider metadata' } },
+      },
+    },
+
+    '/oauth/jwks': {
+      get: {
+        tags: ['OpenID Connect'],
+        summary: 'Public keys ID tokens are signed with',
+        responses: { 200: { description: 'JSON Web Key Set' } },
+      },
+    },
+
+    '/oauth/authorize': {
+      get: {
+        tags: ['OpenID Connect'],
+        summary: 'Start a sign-in (the browser is sent here)',
+        description:
+          'Shows the gateway\'s sign-in page. After the user signs in, the browser is redirected to ' +
+          '`redirect_uri` with `code` and `state`. An unknown `client_id` or a `redirect_uri` that is ' +
+          'not registered exactly gets an error page, never a redirect; every other error is returned ' +
+          'to the redirect URI as `error` / `error_description`.',
+        parameters: [
+          { name: 'response_type', in: 'query', required: true, schema: { type: 'string', enum: ['code'] } },
+          { name: 'client_id', in: 'query', required: true, schema: { type: 'string' } },
+          { name: 'redirect_uri', in: 'query', required: true, schema: { type: 'string' } },
+          { name: 'scope', in: 'query', required: true, schema: { type: 'string', example: 'openid profile' }, description: 'Must include `openid`' },
+          { name: 'state', in: 'query', schema: { type: 'string' }, description: 'Returned unchanged; the client checks it' },
+          { name: 'nonce', in: 'query', schema: { type: 'string' }, description: 'Returned in the ID token' },
+          { name: 'code_challenge', in: 'query', required: true, schema: { type: 'string' }, description: 'BASE64URL(SHA-256(code_verifier))' },
+          { name: 'code_challenge_method', in: 'query', required: true, schema: { type: 'string', enum: ['S256'] } },
+        ],
+        responses: {
+          200: { description: 'The sign-in page (HTML)' },
+          303: { description: 'Redirect back to the client with an error' },
+          400: { description: 'Unknown client or unregistered redirect URI (HTML error page)' },
+        },
+      },
+      post: {
+        tags: ['OpenID Connect'],
+        summary: 'Submit the sign-in form',
+        description:
+          'Posted by the sign-in page itself, not by clients. Draws on the same attempt limits as ' +
+          '/auth/login and gives the same single failure message. An account holding a temporary ' +
+          'password is asked to replace it before a code is issued.',
+        requestBody: { content: { 'application/x-www-form-urlencoded': { schema: { type: 'object' } } } },
+        responses: {
+          200: { description: 'The page again — asking for a new password' },
+          303: { description: 'Signed in: redirect to the client with `code` and `state`' },
+          400: { description: 'The form was altered or has expired' },
+          401: { description: 'Invalid username or password (the page, with that message)' },
+          403: { description: 'The account is suspended' },
+          429: { description: 'Too many attempts' },
+        },
+      },
+    },
+
+    '/oauth/token': {
+      post: {
+        tags: ['OpenID Connect'],
+        summary: 'Exchange an authorization code for tokens',
+        description:
+          'A code works once, within 60 seconds, for the client and redirect URI it was issued to, ' +
+          'and only with the verifier matching its challenge. Presenting a code a second time is ' +
+          'refused and revokes the token issued the first time. Browser clients may call this from ' +
+          'the origin of a registered redirect URI.',
+        requestBody: {
+          required: true,
+          content: { 'application/x-www-form-urlencoded': { schema: {
+            type: 'object', required: ['grant_type', 'code', 'redirect_uri', 'client_id', 'code_verifier'],
+            properties: {
+              grant_type: { type: 'string', enum: ['authorization_code'] },
+              code: { type: 'string' }, redirect_uri: { type: 'string' },
+              client_id: { type: 'string' }, code_verifier: { type: 'string' },
+            },
+          } } },
+        },
+        responses: {
+          200: {
+            description: 'Tokens',
+            content: { 'application/json': { schema: { type: 'object', properties: {
+              access_token: { type: 'string', description: 'A gateway session token — use it as the Bearer token for this API' },
+              token_type: { type: 'string', example: 'Bearer' },
+              expires_in: { type: 'integer' },
+              id_token: { type: 'string', description: 'RS256 JWT: sub, preferred_username, nonce, at_hash' },
+              scope: { type: 'string' },
+            } } } },
+          },
+          400: { description: '`invalid_grant`, `invalid_request` or `unsupported_grant_type`' },
+        },
+      },
+    },
+
+    '/oauth/userinfo': {
+      get: {
+        tags: ['OpenID Connect'],
+        summary: 'Who the access token belongs to',
+        security: [{ BearerAuth: [] }],
+        responses: { 200: { description: '`sub` and `preferred_username`' }, 401: { description: 'Missing or invalid token' } },
+      },
+    },
+
+    '/admin/oidc/clients': {
+      get: {
+        tags: ['Admin'],
+        summary: 'List the applications that may sign people in',
+        security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'Registered clients, including the built-in console' }, 403: { description: 'Admin privileges required' } },
+      },
+      post: {
+        tags: ['Admin'],
+        summary: 'Register an application',
+        description:
+          'Clients are public (no secret; PKCE protects the exchange). Redirect URIs are matched ' +
+          'exactly and must be https, or http on loopback; no fragments.',
+        security: [{ BearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object', required: ['name', 'redirectUris'],
+            properties: {
+              name: { type: 'string', example: 'Reports portal' },
+              redirectUris: { type: 'array', items: { type: 'string' }, example: ['https://reports.example.org/callback'] },
+            },
+          } } },
+        },
+        responses: {
+          201: { description: 'Registered; the response carries the new `clientId`' },
+          400: { description: 'A redirect URI is not acceptable' },
+          403: { description: 'Admin privileges required' },
+        },
+      },
+    },
+
+    '/admin/oidc/clients/{clientId}': {
+      delete: {
+        tags: ['Admin'],
+        summary: 'Remove an application',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'clientId', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          200: { description: 'Removed — sign-ins to it stop' },
+          403: { description: 'Admin privileges required' },
+          404: { description: 'No such client' },
+          409: { description: 'The console is built in and cannot be removed' },
+        },
+      },
+    },
+
+    '/metrics': {
+      get: {
+        tags: ['Operations'],
+        summary: 'Metrics, in Prometheus text format',
+        description:
+          'Error rates by area and status, policy synchronisation latency, Redis status, backup age ' +
+          'and log-forwarding health. Off (404) unless the gateway was started with METRICS_TOKEN; ' +
+          'answers only that token — an account\'s session, even an admin\'s, is not accepted.',
+        security: [{ BearerAuth: [] }],
+        responses: {
+          200: { description: 'text/plain; version=0.0.4' },
+          401: { description: 'The scrape token is missing or wrong' },
+          404: { description: 'Metrics are not enabled' },
+        },
+      },
+    },
+
     '/auth/change-password': {
       post: {
         tags: ['Auth'],
@@ -272,7 +551,9 @@ const spec = {
         description:
           'Verifies the current password, stores the new one (Argon2), and ' +
           'bumps the account\'s tokenVersion — invalidating every ' +
-          'outstanding JWT for this user, including the one used on this call.',
+          'outstanding JWT for this user, including the one used on this call.\n\n' +
+          'This is also how a temporary password is replaced: it is one of the two routes an ' +
+          'account with `mustChangePassword` can reach.',
         security: [{ BearerAuth: [] }],
         requestBody: {
           required: true,
@@ -291,7 +572,7 @@ const spec = {
         },
         responses: {
           200: { description: 'Password changed; all sessions invalidated' },
-          400: { description: 'Missing currentPassword or newPassword' },
+          400: { description: 'Missing currentPassword or newPassword, or the new password is the same as the current one' },
           401: { description: 'Missing/invalid token, or current password incorrect' },
         },
       },
@@ -453,13 +734,108 @@ const spec = {
       },
     },
 
+    '/admin/users/{username}/suspend': {
+      post: {
+        tags: ['Admin'],
+        summary: 'Suspend an account',
+        description:
+          'Switches the account off without destroying it. It can no longer sign in, and every ' +
+          'session it has is ended at once (its security version is moved, so every token issued ' +
+          'before this call stops authenticating). Roles, tenant memberships and requests are ' +
+          'kept, so reactivating restores it whole. An admin cannot suspend their own account.',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'username', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          200: { description: 'Suspended; sessions ended' },
+          401: { description: 'Missing or invalid token' },
+          403: { description: 'Admin privileges required' },
+          404: { description: 'User not found' },
+          409: { description: 'You cannot suspend your own account' },
+        },
+      },
+    },
+
+    '/admin/users/{username}/reactivate': {
+      post: {
+        tags: ['Admin'],
+        summary: 'Reactivate a suspended account',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'username', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          200: { description: 'Reactivated — the account can sign in again' },
+          401: { description: 'Missing or invalid token' },
+          403: { description: 'Admin privileges required' },
+          404: { description: 'User not found' },
+        },
+      },
+    },
+
+    '/admin/users/{username}/revoke-sessions': {
+      post: {
+        tags: ['Admin'],
+        summary: 'End every session of an account',
+        description: 'The account stays active and can sign in again; every token it holds now stops working.',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'username', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          200: { description: 'Sessions ended' },
+          403: { description: 'Admin privileges required' },
+          404: { description: 'User not found' },
+        },
+      },
+    },
+
+    '/admin/users/{username}/recovery-link': {
+      post: {
+        tags: ['Admin'],
+        summary: 'Issue a one-time password recovery link',
+        description:
+          'For handing to the account\'s owner out of band. Unlike reset-password, the admin never ' +
+          'learns the password. The link works once, for 30 minutes, and cancels any earlier one. ' +
+          'It is returned in this response only; it is not logged.',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'username', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          200: { description: '`link`, `token` and `expiresAt`' },
+          403: { description: 'Admin privileges required' },
+          404: { description: 'User not found' },
+        },
+      },
+    },
+
+    '/admin/users/{username}/attributes': {
+      put: {
+        tags: ['Admin'],
+        summary: 'Set the attributes policy conditions are evaluated against',
+        description:
+          'Replaces the account\'s attributes (`subject.*` in a condition). Only a platform admin can: ' +
+          'an account that could describe itself could satisfy any condition. Ends the account\'s sessions.',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'username', in: 'path', required: true, schema: { type: 'string' } }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object', required: ['attributes'],
+            properties: { attributes: { type: 'object', example: { department: 'radiology', clearance: 2 } } },
+          } } },
+        },
+        responses: {
+          200: { description: 'Attributes replaced' },
+          400: { description: 'Not a flat object of strings, numbers and booleans' },
+          403: { description: 'Admin privileges required' },
+          404: { description: 'User not found' },
+        },
+      },
+    },
+
     '/admin/users/{username}/reset-password': {
       post: {
         tags: ['Admin'],
         summary: "Force-reset a user's password",
         description:
-          'Sets a new password on the target account and bumps its ' +
-          'tokenVersion, invalidating every JWT that account currently holds.',
+          'Sets a TEMPORARY password on the target account — its holder must replace it at next ' +
+          'sign-in — and bumps its tokenVersion, invalidating every JWT that account currently holds. ' +
+          'Prefer a recovery link, which does not put the account\'s password in an admin\'s hands.',
         security: [{ BearerAuth: [] }],
         parameters: [{ name: 'username', in: 'path', required: true, schema: { type: 'string' } }],
         requestBody: {
@@ -605,6 +981,12 @@ const spec = {
                   type: 'object',
                   properties: {
                     count: { type: 'integer', example: 4 },
+                    version: {
+                      type: 'integer',
+                      description:
+                        'The policy version this gateway instance is enforcing. Every change, made through ' +
+                        'any instance, increments it; instances that have seen the same changes report the same number.',
+                    },
                     policies: { type: 'array', items: { $ref: '#/components/schemas/PolicyEntry' } },
                   },
                 },
@@ -620,7 +1002,9 @@ const spec = {
         summary: 'Add a Casbin access-control policy rule',
         description:
           'Adds a `(subject, resource, action)` rule. ' +
-          'Subject is a role. Resource supports `keyMatch` wildcards.',
+          'Subject is a role name, a tenant role (`t:{tenant}:{role}`), or one account written ' +
+          'explicitly as `user:{username}`. Resource supports `keyMatch` wildcards. ' +
+          'An optional `condition` (see the Condition schema) makes the rule grant only while it holds.',
         security: [{ BearerAuth: [] }],
         requestBody: {
           required: true,
@@ -785,10 +1169,32 @@ const spec = {
     '/gateway/{serviceName}/{subpath}': {
       get: {
         tags: ['Gateway'],
-        summary: 'Proxy GET to a downstream service',
+        summary: 'Proxy a request to a downstream service (any method)',
         description:
           'Checks JWT validity → evaluates Casbin policy for `/{serviceName}/{subpath}` → ' +
           'proxies to the registered service.\n\n' +
+          '**What is forwarded.** The path after `/gateway` exactly as sent (percent-encoding and ' +
+          '`//` preserved, not re-normalised), the query string exactly as sent (never parsed; it ' +
+          'plays no part in authorization), and the body untouched — the gateway does not read ' +
+          'proxied bodies, so POST / PUT / PATCH payloads of any content type and size reach the ' +
+          'service byte for byte. A path containing `.` or `..` segments (plain or `%2e`) is ' +
+          'refused with 400 rather than forwarded.\n\n' +
+          '**Budget.** Every authenticated request is counted against its account (by account id): ' +
+          'proxied calls against `GATEWAY_REQUESTS_PER_MINUTE`, calls to the gateway\'s own API ' +
+          'against `API_REQUESTS_PER_MINUTE` (1200 each by default). Responses carry ' +
+          '`RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`; over budget is ' +
+          '`429` with `code: "RATE_LIMITED"` and `Retry-After`.\n\n' +
+          '**What the service receives.** Not the caller\'s token: the `Authorization` header is ' +
+          'removed before the request is forwarded, because a bearer token is a credential for ' +
+          'the whole platform and a service needs none of that to answer one call. The service is ' +
+          'told who is calling instead — `X-Gateway-User-Id` (the account\'s immutable id) and ' +
+          '`X-Gateway-User` (its username, URI-encoded). Both are set by the gateway on every ' +
+          'request, overwriting anything the caller sent. A service receives the original token ' +
+          'only if the platform operator has listed it in `FORWARD_AUTHORIZATION_TO`.\n\n' +
+          '**Where it may be sent.** Only to an address inside `UPSTREAM_ALLOWED_CIDRS`. The ' +
+          'service\'s hostname is resolved by the gateway, every resolved address is checked, and ' +
+          'the connection is made to that address — a name that starts resolving somewhere else ' +
+          'is answered with 502, not followed.\n\n' +
           '**Seeded policies (ready to test):**\n' +
           '| Role | Resource | Action |\n' +
           '|---|---|---|\n' +
@@ -914,16 +1320,31 @@ const spec = {
           + '`POST /tenants/register`) to onboard a new one.\n\n'
           + '**`catalogUrl` is optional.** If it is absent or unreachable the service is still '
           + 'registered, from the metadata in this request, and the response carries a `warnings` '
-          + 'array explaining what could not be verified; the periodic health check fills in live '
-          + 'metadata as soon as the service answers. (Registration used to fail outright with 502 '
+          + 'array explaining what could not be verified. The periodic health check then records '
+          + 'whether the service answers, but does not read its configuration from it — send '
+          + '`PATCH /services/{name}` with `syncFromCatalog: true` to adopt what the catalog says. (Registration used to fail outright with 502 '
           + 'whenever the catalog could not be reached, which made a not-yet-running service '
           + 'impossible to onboard.)\n\n'
           + '**The registered `name` is authoritative.** A remote catalog reporting a different '
           + 'name cannot rename the entry — it only produces a warning.\n\n'
+          + '**Creating needs an authenticated caller.** A name that is not yet registered can be '
+          + 'created by the gateway acting for a signed-in user (`POST /tenants/register`, '
+          + '`POST /admin/tenants`), or by a service presenting the operator-issued enrollment token '
+          + 'as `X-Enrollment-Token`. Anything else is a 401. With no `REGISTRY_ENROLLMENT_TOKEN` '
+          + 'configured, direct self-registration is off and the gateway is the only way in.\n\n'
+          + '`createOnly: true` makes the call refuse (409) if the name already exists, whoever is '
+          + 'asking; the gateway sets it when it vouches for a user who may add a service but has '
+          + 'no claim on an existing one.\n\n'
           + '**Name ownership.** The first registration of a name returns a one-time '
-          + '`serviceToken`. Re-registering the same name at the same `baseUrl` stays open (so a '
-          + 'restarting service needs no state of its own), but repointing it at a different host '
-          + 'requires that token.\n\n'
+          + '`serviceToken`. From then on, anything that changes or removes the record needs that '
+          + 'token (`X-Service-Token` header or `serviceToken` body field): registering over the '
+          + 'name again, `PATCH`, `DELETE`. That includes re-registering at the *same* `baseUrl` — '
+          + 'a name and its address are both public, so matching them proves nothing. A service '
+          + 'that is only restarting does not register again; it calls '
+          + '`POST /services/{name}/heartbeat`.\n\n'
+          + '**Destinations.** `baseUrl` and `catalogUrl` must be http(s) URLs without credentials '
+          + 'whose host resolves inside `UPSTREAM_ALLOWED_CIDRS` (and matches '
+          + '`UPSTREAM_ALLOWED_HOSTS` / `_PORTS` if those are set). Anything else is a 400.\n\n'
           + '**Duplicates.** A *different* name at the same `baseUrl` is allowed — one process '
           + 'routinely hosts many logical services — and the response warns which other services '
           + 'share that host. What is refused (409, with `duplicateOf`) is pointing a new name at '
@@ -1014,12 +1435,16 @@ const spec = {
     '/services/{name}': {
       patch: {
         tags: ['Registry'],
-        summary: "Update a registered service's metadata",
+        summary: "Change a registered service's configuration",
         description:
           'Requires the service token issued at first registration — pass it as the '
           + '`X-Service-Token` header or a `serviceToken` body field. Tenant admins normally go '
           + 'through `PATCH /tenants/{tenantId}/service` instead, which replays the stored token '
-          + 'for them.',
+          + 'for them.\n\n'
+          + 'This is the only way configuration changes. The health check records liveness '
+          + '(`health`, `lastSeen`) and nothing else; it no longer copies endpoints, version or '
+          + 'owner from the catalog, and never changes `status`. Pass `syncFromCatalog: true` to '
+          + 're-read those from the service\'s `catalogUrl` as part of this (authenticated) call.',
         parameters: [{ name: 'X-Service-Token', in: 'header', schema: { type: 'string' } }],
         requestBody: {
           content: { 'application/json': { schema: { type: 'object', properties: {
@@ -1028,6 +1453,8 @@ const spec = {
             version: { type: 'string' }, owner: { type: 'string' },
             displayName: { type: 'string' }, description: { type: 'string' },
             status: { type: 'string', enum: ['active', 'inactive'] },
+            syncFromCatalog: { type: 'boolean', description: 'Re-read endpoints, version and owner from catalogUrl' },
+            serviceToken: { type: 'string' },
           } } } },
         },
         responses: {
@@ -1067,6 +1494,11 @@ const spec = {
       delete: {
         tags: ['Registry'],
         summary: 'Deregister a service',
+        description:
+          'Requires the service token (`X-Service-Token` header or `serviceToken` body field). '
+          + 'Removing a record takes the service off the gateway for everyone and frees its name, '
+          + 'so only its owner — or a platform admin, through '
+          + '`DELETE /admin/tenants/{tenantId}?deregister=true` — may do it.',
         parameters: [
           {
             in: 'path',
@@ -1074,10 +1506,34 @@ const spec = {
             required: true,
             schema: { type: 'string' },
           },
+          { name: 'X-Service-Token', in: 'header', schema: { type: 'string' } },
         ],
         responses: {
           200: { description: 'Removed from registry' },
+          403: { description: 'Missing or wrong service token' },
           404: { description: 'Not found' },
+        },
+      },
+    },
+
+    '/services/{name}/heartbeat': {
+      post: {
+        tags: ['Registry'],
+        summary: 'Renew a service registration',
+        description:
+          'Lifecycle renewal — "this service is up". Requires the service token. It takes no '
+          + 'configuration and changes none: only `health` and `lastSeen` are written, and any '
+          + 'other field in the body is ignored. This is what a service calls when it starts '
+          + 'again; registration is for creating the record, `PATCH` for changing it. The current '
+          + 'record is returned so the service can see whether it still matches what it serves.',
+        parameters: [
+          { in: 'path', name: 'name', required: true, schema: { type: 'string' } },
+          { name: 'X-Service-Token', in: 'header', schema: { type: 'string' } },
+        ],
+        responses: {
+          200: { description: 'Renewed; returns the current record' },
+          403: { description: 'Missing or wrong service token' },
+          404: { description: 'No such service — register it' },
         },
       },
     },
@@ -1095,8 +1551,10 @@ const spec = {
           'The front door for onboarding a service. Registers it with the Service Registry, '
           + 'provisions a tenant named after it, and makes the caller its first administrator.\n\n'
           + '`catalogUrl` is optional, and an unreachable one is **not** an error: the service is '
-          + 'registered from the metadata in this request and the registry fills in live metadata '
-          + 'once the service answers. Warnings are reported in the response.',
+          + 'registered from the metadata in this request, and the registry starts reporting it '
+          + 'healthy once it answers. Its endpoints stay as given here until changed through '
+          + '`PATCH /tenants/{tenantId}/service` (`syncFromCatalog: true` re-reads them from the '
+          + 'catalog). Warnings are reported in the response.',
         security: [{ BearerAuth: [] }],
         requestBody: {
           required: true,
@@ -1161,6 +1619,7 @@ const spec = {
           content: { 'application/json': { schema: { type: 'object', properties: {
             displayName: { type: 'string' }, description: { type: 'string' },
             status: { type: 'string', enum: ['active', 'suspended'] },
+            attributes: { type: 'object', description: 'What conditions see as `resource.*` for this tenant\'s service', example: { department: 'radiology' } },
           } } } },
         },
         responses: { 200: { description: 'Updated' }, 403: { description: 'Not a tenant admin' } },
@@ -1275,6 +1734,36 @@ const spec = {
       },
     },
 
+    '/tenants/{tenantId}/users/{username}/permissions': {
+      parameters: [
+        { name: 'tenantId', in: 'path', required: true, schema: { type: 'string' } },
+        { name: 'username', in: 'path', required: true, schema: { type: 'string' } },
+      ],
+      put: {
+        tags: ['Tenants'],
+        summary: 'Delegate parts of administering the tenant to a member (full tenant admin)',
+        description:
+          'Administration is four separate permissions: `members` (add and remove members), `roles` ' +
+          '(define, grant and revoke roles; decide requests), `policies` (what a role may reach) and ' +
+          '`destinations` (where the service lives). The body is the complete set the member should ' +
+          'hold; anything left out is taken away, which ends their sessions. A full tenant admin ' +
+          'holds all four and is the only one who can call this.',
+        security: [{ BearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: {
+            type: 'object', required: ['permissions'],
+            properties: { permissions: { type: 'array', items: { type: 'string', enum: ['members', 'roles', 'policies', 'destinations'] }, example: ['members', 'roles'] } },
+          } } },
+        },
+        responses: {
+          200: { description: 'Permissions replaced' },
+          403: { description: 'Not a full administrator of this tenant' },
+          404: { description: 'No such account (an account that is not yet a member becomes one)' },
+        },
+      },
+    },
+
     '/tenants/{tenantId}/users/{username}/test-access': {
       parameters: [
         { name: 'tenantId', in: 'path', required: true, schema: { type: 'string' } },
@@ -1282,21 +1771,22 @@ const spec = {
       ],
       post: {
         tags: ['Tenants'],
-        summary: "Probe every endpoint of this tenant's service as that user",
+        summary: "Would the gateway let that user reach this tenant's endpoints?",
         description:
-          'Mints a short-lived (60s) impersonation token and calls the gateway over loopback, so '
-          + 'the result reflects the real authenticate → enforce → proxy path rather than a '
-          + 're-reading of the policy table. Audited.\n\n'
-          + 'The response records the **whole exchange** for each endpoint: the request as it was '
-          + 'sent (method, URL, headers), and the response status, headers and body — so a role '
-          + 'grant can be verified by what the caller actually receives, not just by a status '
-          + 'code. `deniedBy` separates a gateway policy denial from an upstream one.\n\n'
-          + "The token's decoded header and claims are returned in full; its raw value is masked. "
-          + 'A complete token would be a working credential for that account across every tenant '
-          + 'they belong to — not only this one — which would make an access test a means of '
-          + 'impersonation.',
+          'Evaluated in-process by the same authorization function the proxy route uses, so the '
+          + 'answer is the live path\'s own decision. **No token is issued for the user and no request '
+          + 'is sent to the service**: an administrator of one tenant never holds, even briefly, a '
+          + 'credential for an account that may belong to other tenants. Audited.\n\n'
+          + 'Only this tenant\'s own `/{tenantId}/...` endpoints are evaluated. Each one reports '
+          + '`decision` (`allowed`, `denied`, or `error` when the service is not routable), '
+          + '`grantedBy` (the policy row, or the bypass role, that allows it) or `stoppedBy` plus an '
+          + '`explanation`, and `status` — what the gateway itself would answer, `null` when it would '
+          + 'forward the call. What the service would then reply is not part of this result; the '
+          + 'account can see that for itself with `POST /me/test-access`.\n\n'
+          + '`POST /admin/users/{username}/test-access` is the same evaluation across every service, '
+          + 'for a platform admin.',
         security: [{ BearerAuth: [] }],
-        responses: { 200: { description: 'Token claims plus, per endpoint, the request sent and the response received' } },
+        responses: { 200: { description: '`mode: "policy-evaluation"` and, per endpoint, the decision and what granted or stopped it' } },
       },
     },
 
@@ -1306,12 +1796,13 @@ const spec = {
         summary: 'Test your own access and see exactly what you get',
         description:
           'The counterpart to the admin and tenant-admin access tests, for the person whose access '
-          + 'it is. Calls every endpoint on the gateway **with your own bearer token** rather than '
-          + 'a minted one, so the result is literally what your current session gets — including, '
-          + 'if your token is stale or revoked, the 401 you would really see.\n\n'
+          + 'it is. Calls every endpoint on the gateway **with your own bearer token**, so the result '
+          + 'is literally what your current session gets — including, if your token is stale or '
+          + 'revoked, the 401 you would really see.\n\n'
           + 'Each endpoint reports the request that was sent and the status, headers and body that '
-          + 'came back. Because the token is your own and already in your browser, it is returned '
-          + 'unmasked here; the admin-facing tests mask it, since there it belongs to somebody else.',
+          + 'came back (`mode: "live-call"`). This is the only access test that makes real calls: '
+          + 'the admin-facing ones evaluate policy without any token, because there the account '
+          + 'belongs to somebody else.',
         security: [{ BearerAuth: [] }],
         responses: {
           200: {
@@ -1415,9 +1906,10 @@ const spec = {
             role:     { type: 'string', example: 'engineer' },
             resource: { type: 'string', example: '/payments/charge' },
             action:   { type: 'string', enum: ['get', 'post', 'put', 'patch', 'delete'], example: 'get' },
+            condition: { $ref: '#/components/schemas/Condition' },
           } } } },
         },
-        responses: { 201: { description: 'Policy added' }, 403: { description: 'Resource is outside this tenant\'s namespace' }, 409: { description: 'Policy already exists' } },
+        responses: { 201: { description: 'Policy added' }, 400: { description: 'The condition is not valid' }, 403: { description: 'Resource is outside this tenant\'s namespace, or the `policies` permission is missing' }, 409: { description: 'Policy already exists' } },
       },
       delete: {
         tags: ['Tenants'],

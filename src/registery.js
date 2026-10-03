@@ -22,18 +22,27 @@ const Redis = require('ioredis');
 const swaggerUi = require('swagger-ui-express');
 const { spec } = require('./swagger');
 const { createLogger } = require('./logger');
-const { validateTenantId } = require('./tenancy');
+const { createDestinationGuardFromEnv } = require('./netguard');
+const { v, validate, bodyParseErrors, JSON_BODY_LIMIT } = require('./validation');
 
 const log = createLogger('registry');
 
+// Where a registered service may live. Built first, so a malformed allowlist
+// stops the process instead of leaving it running with no rule at all.
+const destinations = createDestinationGuardFromEnv();
+
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
+app.use(bodyParseErrors);
 app.use(log.requestLogger());
 
 // --- CONSTANTS ---
 const REGISTRY_PORT = process.env.PORT || 3001;
 const HEALTH_CHECK_INTERVAL_MS = 15000;
 const HEALTH_CHECK_TIMEOUT_MS = 3000;
+// A catalog is a few lines of JSON. Capping what is read stops a destination
+// from answering a health check with an endless body.
+const CATALOG_MAX_BYTES = 256 * 1024;
 
 // Redis key helpers — centralised so typos don't cause silent bugs
 const REDIS_KEYS = {
@@ -65,13 +74,19 @@ redis.on('reconnecting', () => console.warn('[Redis] Reconnecting...'));
 
 // --- SERVICE TOKENS (name ownership) ---
 //
-// The first registration of a name mints a token and returns it once. After
-// that, the name can only be repointed at a *different* baseUrl by presenting
-// that token. Re-registering the same name at the same baseUrl stays free, so
-// a service that self-registers on every restart (llm.reg.js, vision.reg.js)
-// needs no state of its own — but nobody else can quietly redirect `/llm` at
-// their own host, which in a multi-tenant system would hand them another
-// tenant's traffic, headers and bearer tokens.
+// The first registration of a name mints a token and returns it once. From
+// then on that token is the only thing that can change the record: repoint it,
+// edit its catalogUrl or endpoints, renew it, or remove it. Whoever holds it
+// owns the name; nobody else can touch it (the gateway aside — see below).
+//
+// An earlier version let a second registration through without the token as
+// long as it named the same baseUrl, so that a restarting service needed no
+// state. But a service's name and baseUrl are both printed by GET /services,
+// so that was no test at all: anyone could re-register `llm` at its own
+// address with a catalogUrl of their choosing, and the registry would fetch
+// that URL and adopt the endpoints it advertised. A restart is now its own
+// operation (POST /services/:name/heartbeat) that renews the record and
+// cannot alter it.
 //
 // Only the SHA-256 of the token is stored: a Redis dump then leaks no usable
 // credential.
@@ -124,6 +139,45 @@ function isPlatformCall(req) {
   const a = Buffer.from(presented);
   const b = Buffer.from(registryAdminToken);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// --- ENROLLMENT (who may create a record) ------------------------------------
+//
+// A service token answers "may this caller change THIS record". Nothing
+// answered "may this caller create one": POST /register for an unused name
+// was open to anyone who could reach the port. Creating a record is not
+// harmless — it puts a route on the gateway, provisions a tenant for it, and
+// has the registry start probing whatever URL it names — so it now needs a
+// caller the registry can authenticate, in one of two ways:
+//
+//   the gateway      an authenticated user registering through it; it vouches
+//                    with the platform override token above.
+//   a service        registering itself directly, with the enrollment token
+//                    the operator configured (REGISTRY_ENROLLMENT_TOKEN) and
+//                    gave to the services meant to do that.
+//
+// There is no default enrollment token. Unset, self-registration is simply
+// off and the gateway is the only way in.
+const ENROLLMENT_TOKEN_MIN_LENGTH = 32;
+
+function loadEnrollmentToken() {
+  const token = process.env.REGISTRY_ENROLLMENT_TOKEN;
+  if (!token) return null;
+  if (token.length < ENROLLMENT_TOKEN_MIN_LENGTH) {
+    console.error(`[Registry] Refusing to start: REGISTRY_ENROLLMENT_TOKEN is too short (${token.length} chars; need at least ${ENROLLMENT_TOKEN_MIN_LENGTH}).`);
+    console.error('[Registry] Generate one with:  openssl rand -hex 32   (or unset it to turn self-registration off)');
+    process.exit(1);
+  }
+  return token;
+}
+
+const enrollmentToken = loadEnrollmentToken();
+
+function hasEnrollmentToken(req) {
+  const presented = req.get('X-Enrollment-Token');
+  if (!presented || !enrollmentToken) return false;
+  // Compared as digests so the two buffers are always the same length.
+  return crypto.timingSafeEqual(Buffer.from(hashToken(presented)), Buffer.from(hashToken(enrollmentToken)));
 }
 
 /** Either proof of name ownership, or the gateway vouching for the caller. */
@@ -368,10 +422,20 @@ async function repairCorruptEntries() {
  * Fetches the /catalog endpoint from a registered service to pull its
  * live metadata (endpoints, version, etc.)
  *
+ * This is the registry making a request to an address somebody typed in, so
+ * it goes through the destination guard twice: the URL is checked before
+ * anything is sent, and the connection is made through an agent that will
+ * only open a socket to an address inside the allowed networks. Redirects are
+ * refused outright — following one would let an allowed host send the
+ * registry somewhere that is not.
+ *
  * @param {string} catalogUrl
  * @returns {Promise<object>}
  */
 async function fetchServiceCatalog(catalogUrl) {
+  const refused = destinations.check(catalogUrl);
+  if (refused) throw new Error(`catalogUrl ${refused}`);
+
   const { default: fetch } = await import('node-fetch');
 
   const controller = new AbortController();
@@ -381,7 +445,12 @@ async function fetchServiceCatalog(catalogUrl) {
   );
 
   try {
-    const response = await fetch(catalogUrl, { signal: controller.signal });
+    const response = await fetch(catalogUrl, {
+      signal: controller.signal,
+      agent: (url) => destinations.agentFor(url),
+      redirect: 'error',
+      size: CATALOG_MAX_BYTES,
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return await response.json();
   } finally {
@@ -389,17 +458,73 @@ async function fetchServiceCatalog(catalogUrl) {
   }
 }
 
-// --- HEALTH CHECKS ---
+/**
+ * Validates the URLs in a registration or an edit against the destination
+ * allowlist. Returns the reason to refuse, or null — and pushes a warning for
+ * a name that does not resolve yet, since a service may be registered before
+ * it exists (it will be refused at connect time if it resolves badly later).
+ */
+async function refuseDestinations(urls, warnings) {
+  for (const [field, url] of Object.entries(urls)) {
+    if (!url) continue;
+    const { reason, unresolved } = await destinations.inspect(url);
+    if (reason) return `${field} ${reason}`;
+    if (unresolved) {
+      warnings.push(`${field} host could not be resolved (${unresolved}) — it will only be reachable once it resolves to an address inside the allowed networks`);
+    }
+  }
+  return null;
+}
+
+// --- LIFECYCLE (liveness) vs CONFIGURATION ---
+//
+// A record has two kinds of field, and they change for different reasons:
+//
+//   configuration   baseUrl, catalogUrl, endpoints, version, owner,
+//                   displayName, description, status
+//                   — what the service IS and where it lives. Changed only by
+//                   someone who proves they own the name.
+//
+//   lifecycle       health, lastSeen
+//                   — whether it is answering right now. Changed by the health
+//                   check below and by a service's own heartbeat.
+//
+// Nothing on the lifecycle side may write a configuration field. The health
+// check used to: every probe copied version, owner and endpoints out of
+// whatever the catalog URL returned and flipped `status`, so the record was
+// rewritten every fifteen seconds by a process that had authenticated nobody
+// — undoing an admin's edit, re-enabling a service that had been switched
+// off, and racing any PATCH that landed mid-probe. Liveness is now recorded
+// by itself, in one atomic write that touches those two fields only.
+
+// Updates health/lastSeen if — and only if — the record still exists, so a
+// probe that finishes after a deregistration cannot bring half a record back.
+redis.defineCommand('touchServiceLifecycle', {
+  numberOfKeys: 1,
+  lua: `
+    if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+    redis.call('HSET', KEYS[1], 'health', ARGV[1])
+    if ARGV[2] ~= '' then redis.call('HSET', KEYS[1], 'lastSeen', ARGV[2]) end
+    return 1
+  `,
+});
 
 /**
- * Runs a health check against all registered services.
- * Fetches their /catalog endpoint — if it responds, mark active.
- * If it fails, mark inactive but keep the record.
+ * @param {string} name
+ * @param {'ok'|'unreachable'} health
+ * @returns {Promise<boolean>} false if there is no such service
+ */
+async function recordLiveness(name, health) {
+  const seenAt = health === 'ok' ? new Date().toISOString() : '';
+  return (await redis.touchServiceLifecycle(REDIS_KEYS.service(name), health, seenAt)) === 1;
+}
+
+/**
+ * Probes every registered service's catalog URL and records whether it
+ * answered. That is all it does: what the catalog SAYS is not read here.
  *
- * A service registered without a catalogUrl has nothing to probe: it is left
- * exactly as registered (health: 'unchecked') rather than being demoted to
- * inactive, which would make manually registered services permanently
- * unroutable through the gateway.
+ * A service registered without a catalogUrl has nothing to probe and is left
+ * as it is (health: 'unchecked').
  */
 async function runHealthChecks() {
   const names = await redis.smembers(REDIS_KEYS.serviceIndex());
@@ -417,45 +542,34 @@ async function runHealthChecks() {
     if (!serviceData.catalogUrl) return; // nothing to probe
 
     try {
-      const catalog = await fetchServiceCatalog(serviceData.catalogUrl);
-
-      // Sanitised on every probe, not just at registration — otherwise a
-      // catalog advertising someone else's paths simply re-injects them on
-      // the next health check.
-      const probed = partitionEndpointsByNamespace(name, catalog.endpoints);
-      if (probed.dropped.length) {
-        log.warn('health', `[${name}] catalog advertises ${probed.dropped.length} endpoint(s) outside its namespace — ignored`, {
-          name, dropped: probed.dropped,
-        });
-      }
-
-      const updated = {
-        ...serviceData,
-        // Metadata the service is authoritative about...
-        version: catalog.version || serviceData.version,
-        owner: catalog.owner || serviceData.owner,
-        endpoints: Array.isArray(catalog.endpoints) ? probed.kept : serviceData.endpoints,
-        // ...but never its name or baseUrl: those are registry identity, set
-        // at registration, and letting the catalog rewrite them is exactly how
-        // three separate registrations all ended up calling themselves 'llm'.
-        name,
-        baseUrl: serviceData.baseUrl,
-        status: 'active',
-        health: 'ok',
-        lastSeen: new Date().toISOString(),
-      };
-
-      await saveService(name, { ...updated, tokenHash: (await getServiceRaw(name))?.tokenHash });
+      await fetchServiceCatalog(serviceData.catalogUrl);
+      await recordLiveness(name, 'ok');
       log.info('health', `[${name}] healthy at ${serviceData.baseUrl}`, { name });
     } catch (err) {
-      const updated = { ...serviceData, name, status: 'inactive', health: 'unreachable' };
-      await saveService(name, { ...updated, tokenHash: (await getServiceRaw(name))?.tokenHash });
+      await recordLiveness(name, 'unreachable');
       log.warn('health', `[${name}] unreachable: ${err.message}`, { name, error: err.message });
     }
   });
 
   await Promise.allSettled(checks);
 }
+
+// --- REQUEST SHAPES ---
+
+// Accepted wherever a caller may prove ownership in the body rather than the
+// X-Service-Token header.
+const serviceTokenField = v.optional(v.string({ max: 128 }));
+
+const serviceConfigFields = {
+  catalogUrl: v.optional(v.httpUrl({ allowEmpty: true })),
+  endpoints: v.optional(v.endpoints),
+  version: v.optional(v.shortText),
+  owner: v.optional(v.shortText),
+  displayName: v.optional(v.shortText),
+  description: v.optional(v.text(500)),
+};
+
+const serviceNameParam = { name: v.tenantId };
 
 // --- REGISTRY ROUTES ---
 
@@ -470,50 +584,42 @@ async function runHealthChecks() {
  *   version:     "v1",                                  // optional
  *   owner:       "fin_team",                            // optional
  *   displayName: "Payments API",                        // optional
- *   serviceToken: "..."                                 // required only to
- *                                                       // repoint an existing
- *                                                       // name at a new host
+ *   serviceToken: "..."                                 // required if the
+ *                                                       // name already exists
  * }
+ *
+ * For a new name this creates the record and returns its service token, once.
+ * Creating needs an authenticated caller: the gateway (acting for a signed-in
+ * user), or a service presenting X-Enrollment-Token.
+ *
+ * For a name that already exists it is a full replacement of that record's
+ * configuration, and so needs the token (or X-Service-Token) like any other
+ * edit — unless the request says `createOnly`, in which case an existing name
+ * is refused whoever is asking. A service that is merely starting up again
+ * should not come here at all — see POST /services/:name/heartbeat.
  *
  * catalogUrl is a convenience, not a precondition. Registration used to abort
  * with 502 "Cannot reach catalogUrl" whenever the service wasn't already
  * running and serving /catalog — which meant you could never register anything
  * new, only re-register something already up. Now an unreachable (or absent)
  * catalog registers the service from the metadata in the request body and
- * reports the probe result as a warning; the periodic health check fills in
- * the live metadata as soon as the service answers.
+ * reports the probe result as a warning. The periodic health check records
+ * when the service starts answering; adopting what its catalog says is then
+ * an explicit, authenticated step (PATCH with syncFromCatalog).
  */
-app.post('/register', async (req, res) => {
-  const { name, baseUrl, catalogUrl, owner, version, displayName, description } = req.body || {};
+app.post('/register', validate({
+  body: {
+    name: v.newTenantId,
+    baseUrl: v.httpUrl(),
+    ...serviceConfigFields,
+    allowAlias: v.optional(v.boolean()),
+    createOnly: v.optional(v.boolean()),
+    serviceToken: serviceTokenField,
+  },
+}), async (req, res) => {
+  const { name, baseUrl, catalogUrl, owner, version, displayName, description } = req.body;
+  const endpoints = req.body.endpoints || [];
   const warnings = [];
-
-  // --- Validation ---
-  if (!name || !baseUrl) {
-    return res.status(400).json({
-      error: 'Missing required fields: name, baseUrl (catalogUrl is optional)',
-    });
-  }
-
-  const nameError = validateTenantId(name);
-  if (nameError) {
-    return res.status(400).json({ error: nameError });
-  }
-
-  if (!/^https?:\/\//.test(baseUrl)) {
-    return res.status(400).json({ error: 'baseUrl must be a valid HTTP URL' });
-  }
-
-  if (catalogUrl && !/^https?:\/\//.test(catalogUrl)) {
-    return res.status(400).json({ error: 'catalogUrl must be a valid HTTP URL' });
-  }
-
-  let endpoints = [];
-  if (req.body.endpoints !== undefined) {
-    if (!Array.isArray(req.body.endpoints) || req.body.endpoints.some((e) => typeof e !== 'string')) {
-      return res.status(400).json({ error: 'endpoints must be an array of path strings' });
-    }
-    endpoints = req.body.endpoints;
-  }
 
   const badEndpoint = endpoints.find((e) => !e.startsWith(`/${name}/`) && e !== `/${name}`);
   if (badEndpoint) {
@@ -531,20 +637,49 @@ app.post('/register', async (req, res) => {
   let issuedToken = null;
 
   if (existing) {
-    const authorised = mayMutateService(req, tokenHash);
-    if (!authorised && existing.baseUrl !== baseUrl) {
-      log.warn('registry', `Rejected re-registration of '${name}' at a different baseUrl without its service token`, {
+    // The caller asked for "create, or nothing". The gateway sends this when
+    // it is vouching for a user who may register a new service but has no
+    // claim on an existing one — its override would otherwise open any record.
+    if (req.body.createOnly) {
+      return res.status(409).json({
+        error: `Service '${name}' is already registered`,
+        hint: 'Pick a different name. An existing service can only be changed by its owner.',
+      });
+    }
+    // Any registration over an existing name rewrites its configuration, so
+    // it needs proof of ownership whatever it contains — including when it
+    // names the same baseUrl, which anyone can read out of GET /services.
+    if (!mayMutateService(req, tokenHash)) {
+      log.warn('registry', `Rejected re-registration of '${name}' without its service token`, {
         name, registeredBaseUrl: existing.baseUrl, attemptedBaseUrl: baseUrl,
       });
       return res.status(409).json({
-        error: `Service '${name}' is already registered at ${existing.baseUrl}`,
-        hint: 'Pick a different name, or pass the serviceToken issued at first registration to repoint this one',
+        error: `Service '${name}' is already registered`,
+        hint: `Pick a different name, or prove you own this one by passing the serviceToken issued at first registration. A service that is only restarting should call POST /services/${name}/heartbeat instead.`,
       });
     }
   } else {
+    if (!isPlatformCall(req) && !hasEnrollmentToken(req)) {
+      log.warn('registry', `Rejected unauthenticated registration of new service '${name}'`, { name, baseUrl });
+      return res.status(401).json({
+        error: 'Registering a new service requires authentication',
+        hint: enrollmentToken
+          ? 'Register it through the gateway (POST /tenants/register), or present the enrollment token as X-Enrollment-Token'
+          : 'Register it through the gateway (POST /tenants/register). Direct self-registration is switched off: no REGISTRY_ENROLLMENT_TOKEN is configured.',
+      });
+    }
     const token = mintServiceToken();
     tokenHash = hashToken(token);
     issuedToken = token;
+  }
+
+  const refused = await refuseDestinations({ baseUrl, catalogUrl }, warnings);
+  if (refused) {
+    log.warn('registry', `Rejected registration of '${name}': ${refused}`, { name, baseUrl, catalogUrl });
+    return res.status(400).json({
+      error: refused,
+      hint: 'Services may only be registered at destinations inside the configured allowlist (UPSTREAM_ALLOWED_CIDRS / _HOSTS / _PORTS)',
+    });
   }
 
   // --- Optional live catalog probe ---
@@ -568,7 +703,7 @@ app.post('/register', async (req, res) => {
       // name of the service it was copied from.
       if (catalog.name && catalog.name !== name) {
         const collidesWith = await serviceExists(catalog.name);
-        if (collidesWith && !existing && req.body.allowAlias !== true && !isPlatformCall(req)) {
+        if (collidesWith && !existing && req.body.allowAlias !== true) {
           log.warn('registry', `Rejected '${name}': its catalog identifies as the already-registered service '${catalog.name}'`, {
             name, catalogName: catalog.name, catalogUrl,
           });
@@ -633,6 +768,8 @@ app.post('/register', async (req, res) => {
     displayName: displayName || existing?.displayName || name,
     description: description ?? existing?.description ?? '',
     endpoints: resolvedEndpoints,
+    // An explicit re-registration by the owner re-enables the service; the
+    // health check never does.
     status: 'active',
     health: catalog ? 'ok' : (resolvedCatalogUrl ? 'unreachable' : 'unchecked'),
     tokenHash,
@@ -658,11 +795,23 @@ app.post('/register', async (req, res) => {
 
 /**
  * PATCH /services/:name
- * Updates a registered service's own metadata (endpoints, version, display
- * name, description, status) without a full re-registration. Requires the
- * service token — this is the tenant's service, not anyone's to edit.
+ * Changes a registered service's configuration. Requires the service token —
+ * this is the tenant's service, not anyone's to edit.
+ *
+ * `syncFromCatalog: true` re-reads endpoints, version and owner from the
+ * service's catalogUrl. That used to happen by itself on every health check;
+ * it is a configuration change, so it now happens only when the owner asks.
  */
-app.patch('/services/:name', async (req, res) => {
+app.patch('/services/:name', validate({
+  params: serviceNameParam,
+  body: {
+    baseUrl: v.optional(v.httpUrl()),
+    ...serviceConfigFields,
+    status: v.optional(v.oneOf(['active', 'inactive'])),
+    syncFromCatalog: v.optional(v.boolean()),
+    serviceToken: serviceTokenField,
+  },
+}), async (req, res) => {
   const { name } = req.params;
   const raw = await getServiceRaw(name);
   if (!raw) return res.status(404).json({ error: `Service '${name}' not found` });
@@ -672,50 +821,85 @@ app.patch('/services/:name', async (req, res) => {
   }
 
   const current = deserialiseService(raw);
-  const patch = {};
+  const { serviceToken: _token, syncFromCatalog, ...patch } = req.body;
+  const warnings = [];
 
-  if (req.body.endpoints !== undefined) {
-    if (!Array.isArray(req.body.endpoints) || req.body.endpoints.some((e) => typeof e !== 'string')) {
-      return res.status(400).json({ error: 'endpoints must be an array of path strings' });
-    }
-    const bad = req.body.endpoints.find((e) => !e.startsWith(`/${name}/`) && e !== `/${name}`);
-    if (bad) {
-      return res.status(400).json({ error: `Endpoint '${bad}' must start with '/${name}/'` });
-    }
-    patch.endpoints = req.body.endpoints;
+  const bad = (patch.endpoints || []).find((e) => !e.startsWith(`/${name}/`) && e !== `/${name}`);
+  if (bad) {
+    return res.status(400).json({ error: `Endpoint '${bad}' must start with '/${name}/'` });
   }
 
-  for (const field of ['version', 'owner', 'displayName', 'description']) {
-    if (req.body[field] !== undefined) patch[field] = String(req.body[field]);
+  const refused = await refuseDestinations({ baseUrl: patch.baseUrl, catalogUrl: patch.catalogUrl }, warnings);
+  if (refused) {
+    return res.status(400).json({
+      error: refused,
+      hint: 'Services may only be registered at destinations inside the configured allowlist (UPSTREAM_ALLOWED_CIDRS / _HOSTS / _PORTS)',
+    });
   }
 
-  if (req.body.baseUrl !== undefined) {
-    if (!/^https?:\/\//.test(req.body.baseUrl)) {
-      return res.status(400).json({ error: 'baseUrl must be a valid HTTP URL' });
+  if (syncFromCatalog) {
+    const catalogUrl = patch.catalogUrl ?? current.catalogUrl;
+    if (!catalogUrl) {
+      return res.status(400).json({ error: 'This service has no catalogUrl to sync from' });
     }
-    patch.baseUrl = req.body.baseUrl;
-  }
-
-  if (req.body.catalogUrl !== undefined) {
-    if (req.body.catalogUrl && !/^https?:\/\//.test(req.body.catalogUrl)) {
-      return res.status(400).json({ error: 'catalogUrl must be a valid HTTP URL' });
+    let catalog;
+    try {
+      catalog = await fetchServiceCatalog(catalogUrl);
+    } catch (err) {
+      return res.status(502).json({ error: `Could not read the catalog at ${catalogUrl}: ${err.message}` });
     }
-    patch.catalogUrl = req.body.catalogUrl || '';
-  }
-
-  if (req.body.status !== undefined) {
-    if (!['active', 'inactive'].includes(req.body.status)) {
-      return res.status(400).json({ error: "status must be 'active' or 'inactive'" });
+    if (Array.isArray(catalog.endpoints)) {
+      const { kept, dropped } = partitionEndpointsByNamespace(name, catalog.endpoints);
+      if (dropped.length) {
+        warnings.push(`Catalog advertises ${dropped.length} endpoint(s) outside this service's namespace (${dropped.join(', ')}) — ignored`);
+      }
+      patch.endpoints = kept;
     }
-    patch.status = req.body.status;
+    if (typeof catalog.version === 'string') patch.version = catalog.version;
+    if (typeof catalog.owner === 'string') patch.owner = catalog.owner;
   }
 
-  const updated = { ...current, ...patch, name, tokenHash: raw.tokenHash };
-  await saveService(name, updated);
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: 'Nothing to update' });
+  }
+
+  // Only the fields being changed are written, so an edit can never carry a
+  // stale health or lastSeen over a liveness update that landed meanwhile.
+  await redis.hset(REDIS_KEYS.service(name), {
+    ...patch,
+    ...(patch.endpoints ? { endpoints: JSON.stringify(patch.endpoints) } : {}),
+  });
 
   log.audit('registry', `Service '${name}' updated`, { name, fields: Object.keys(patch) });
-  const { tokenHash: _omit, ...publicEntry } = updated;
-  res.json({ message: `Service '${name}' updated`, service: publicEntry });
+  res.json({ message: `Service '${name}' updated`, service: { ...(await getService(name)), name }, warnings });
+});
+
+/**
+ * POST /services/:name/heartbeat
+ * Lifecycle renewal: "this service is up". Requires the service token, takes
+ * no configuration, and changes none — only health and lastSeen.
+ *
+ * This is what a service calls when it starts again. It is deliberately a
+ * different operation from registration: a restart has no reason to carry a
+ * baseUrl, a catalogUrl or an endpoint list, so it is given no way to change
+ * them. The current record is returned, so a service can see whether what is
+ * registered still matches what it serves and send an (authenticated) PATCH
+ * if it does not.
+ */
+app.post('/services/:name/heartbeat', validate({
+  params: serviceNameParam,
+  body: { serviceToken: serviceTokenField },
+}), async (req, res) => {
+  const { name } = req.params;
+  const raw = await getServiceRaw(name);
+  if (!raw) return res.status(404).json({ error: `Service '${name}' not found` });
+
+  if (!mayMutateService(req, raw.tokenHash)) {
+    return res.status(403).json({ error: 'A valid serviceToken is required to renew this service' });
+  }
+
+  await recordLiveness(name, 'ok');
+  res.json({ message: `Service '${name}' renewed`, service: { ...(await getService(name)), name } });
 });
 
 /**
@@ -723,7 +907,9 @@ app.patch('/services/:name', async (req, res) => {
  * Returns all registered services.
  * Optional query: ?status=active  (filter by status)
  */
-app.get('/services', async (req, res) => {
+app.get('/services', validate({
+  query: { status: v.optional(v.oneOf(['active', 'inactive'])) },
+}), async (req, res) => {
   try {
     const { status } = req.query;
     let services = await getAllServices();
@@ -743,7 +929,7 @@ app.get('/services', async (req, res) => {
  * GET /services/:name
  * Returns a single service by name.
  */
-app.get('/services/:name', async (req, res) => {
+app.get('/services/:name', validate({ params: serviceNameParam }), async (req, res) => {
   try {
     const service = await getService(req.params.name);
 
@@ -763,13 +949,14 @@ app.get('/services/:name', async (req, res) => {
 
 /**
  * DELETE /services/:name
- * Deregisters a service (for graceful shutdowns).
- *
- * Open by default so a service can clean up after itself on SIGTERM without
- * carrying credentials. Set REGISTRY_REQUIRE_TOKEN_FOR_DELETE=1 to require the
- * service token instead.
+ * Deregisters a service (for graceful shutdowns). Requires the service token:
+ * removing a record takes its service off the gateway for everyone, and frees
+ * the name for whoever registers it next.
  */
-app.delete('/services/:name', async (req, res) => {
+app.delete('/services/:name', validate({
+  params: serviceNameParam,
+  body: { serviceToken: serviceTokenField },
+}), async (req, res) => {
   const { name } = req.params;
 
   try {
@@ -780,8 +967,7 @@ app.delete('/services/:name', async (req, res) => {
       return res.status(404).json({ error: `Service '${name}' not found` });
     }
 
-    if (process.env.REGISTRY_REQUIRE_TOKEN_FOR_DELETE === '1'
-        && !mayMutateService(req, raw?.tokenHash)) {
+    if (!mayMutateService(req, raw?.tokenHash)) {
       return res.status(403).json({ error: 'A valid serviceToken is required to deregister this service' });
     }
 
@@ -858,9 +1044,16 @@ app.listen(REGISTRY_PORT, async () => {
   console.log(`  POST   /register          - Register a new service`);
   console.log(`  GET    /services          - List all services`);
   console.log(`  GET    /services/:name    - Get single service`);
-  console.log(`  PATCH  /services/:name    - Update service metadata (token required)`);
-  console.log(`  DELETE /services/:name    - Deregister a service`);
+  console.log(`  PATCH  /services/:name    - Change service configuration (token required)`);
+  console.log(`  POST   /services/:name/heartbeat - Renew a service (token required)`);
+  console.log(`  DELETE /services/:name    - Deregister a service (token required)`);
   console.log(`  GET    /health            - Registry health\n`);
+
+  console.log(`[Registry] New services may be registered: through the gateway${enrollmentToken ? ', or directly with the enrollment token' : ' only (no REGISTRY_ENROLLMENT_TOKEN set)'}`);
+  console.log(`[Registry] Allowed destinations: ${destinations.describe()}`);
+  if (!destinations.configured) {
+    log.warn('registry', 'UPSTREAM_ALLOWED_CIDRS is not set — no service can be registered or health-checked until it is');
+  }
 
   await ensureRegistryAdminToken().catch((err) =>
     console.error('[Registry] Could not establish the platform override token:', err.message));

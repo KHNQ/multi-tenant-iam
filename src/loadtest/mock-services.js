@@ -16,8 +16,10 @@
  * Env:      BENCH_PORT (default 9000), REGISTRY_URL, BENCH_SERVICE_COUNT
  */
 
+require('../local-env'); // .env, when run by hand
 const express = require('express');
 const { createLogger } = require('../logger');
+const { createRegistryClient } = require('../registry-client');
 
 const log = createLogger('bench-fleet');
 const app = express();
@@ -86,29 +88,26 @@ app.get('/:name/:action', (req, res) => {
   }, delayMs);
 });
 
+// Each service keeps its own registry token (see registry-client.js), so a
+// restarted fleet renews its fifty records rather than re-registering them.
+const registry = createRegistryClient({ registryUrl: REGISTRY_URL, log });
+
 async function registerAll() {
   let ok = 0;
   let failed = 0;
   for (const svc of services) {
-    try {
-      const resp = await fetch(`${REGISTRY_URL}/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: svc.name, baseUrl: svc.baseUrl, catalogUrl: svc.catalogUrl, owner: svc.owner }),
-      });
-      if (resp.ok) ok++; else failed++;
-    } catch {
-      failed++;
-    }
+    const announced = await registry.announce({
+      name: svc.name, baseUrl: svc.baseUrl, catalogUrl: svc.catalogUrl,
+      owner: svc.owner, version: svc.version, endpoints: svc.endpoints,
+    }, { retries: 1 });
+    if (announced) ok++; else failed++;
   }
   log.audit('registration', `Bench fleet registered ${ok}/${services.length} services`, { ok, failed, total: services.length });
   return { ok, failed };
 }
 
 async function deregisterAll() {
-  await Promise.allSettled(
-    services.map((svc) => fetch(`${REGISTRY_URL}/services/${svc.name}`, { method: 'DELETE' }).catch(() => {})),
-  );
+  await Promise.allSettled(services.map((svc) => registry.deregister(svc.name)));
   log.audit('registration', 'Bench fleet deregistered', { count: services.length });
 }
 

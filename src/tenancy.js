@@ -5,6 +5,7 @@
  *   - its own set of role names          (tenant:{id}:roles)
  *   - its own membership list            (tenant:{id}:members)
  *   - its own administrators             (tenant:{id}:admins)
+ *   - who may do which part of administering it  (tenant:{id}:perm:{permission})
  *   - the Casbin policies for its URL prefix  (/{id}/...)
  *
  * IDENTITY IS GLOBAL, MEMBERSHIP IS PER-TENANT.
@@ -18,20 +19,26 @@
  *
  * Casbin naming
  * ─────────────
- * Tenant roles are namespaced into Casbin's flat subject space as
+ * Casbin has ONE flat subject space, and `g(x, x)` is true for any x. So if a
+ * user and a role can ever be spelled the same way, the user IS the role: an
+ * account that signs up as `blue_role` inherits blue_role's policies, and one
+ * that signs up as `platform_admin` inherits the platform. Every subject is
+ * therefore written with a prefix the gateway adds itself, and nothing a
+ * person types is ever used as a subject on its own:
  *
- *     t:{tenantId}:{roleName}       e.g.  t:llm:engineer
+ *     u:{userId}                    a user — userId is a server-generated UUID,
+ *                                   never the username
+ *     r:{roleName}                  a platform role      e.g.  r:blue_role
+ *     t:{tenantId}:{roleName}       a tenant role        e.g.  t:llm:engineer
  *
- * so `g(alice, t:llm:engineer)` and `p(t:llm:engineer, /llm/claude, get)` are
- * ordinary Casbin rows that the existing matcher already evaluates. No model
- * change, no second enforcer, and cross-tenant leakage is structurally
- * impossible: a tenant can only write policies whose resource sits under its
- * own `/{id}/` prefix (enforced by ownsResource below), and it can only grant
- * subjects carrying its own `t:{id}:` prefix.
- *
- * Global (pre-tenancy) roles like `blue_role` keep working untouched — they
- * carry no `t:` prefix, so they live in the platform namespace that only the
- * platform admin manages.
+ * The three prefixes are disjoint by construction, and role and tenant names
+ * are validated to contain no ':' so one namespace cannot be spelled from
+ * inside another. `g(u:…, t:llm:engineer)` and
+ * `p(t:llm:engineer, /llm/claude, get)` are ordinary Casbin rows; cross-tenant
+ * leakage stays structurally impossible because a tenant can only write
+ * policies whose resource sits under its own `/{id}/` prefix (enforced by
+ * ownsResource below) and can only grant subjects carrying its own `t:{id}:`
+ * prefix.
  */
 
 // --- KEYS ---
@@ -45,6 +52,20 @@ const tenantKey = (id) => `tenant:${id}`;
 const tenantRolesKey = (id) => `tenant:${id}:roles`;
 const tenantMembersKey = (id) => `tenant:${id}:members`;
 const tenantAdminsKey = (id) => `tenant:${id}:admins`;
+const tenantPermissionKey = (id, permission) => `tenant:${id}:perm:${permission}`;
+
+// Administering a tenant is four different jobs, and "tenant admin" used to
+// mean all of them at once: whoever could add a colleague could also repoint
+// the service at another host. Each is now its own grant.
+//
+//   members        who belongs to the tenant
+//   roles          which roles exist, and who holds them
+//   policies       what each role may reach
+//   destinations   where the service lives (its baseUrl, catalogUrl, endpoints)
+//
+// A full administrator (tenant:{id}:admins) holds all four, and is the only
+// one who can hand them out or change the tenant itself.
+const TENANT_PERMISSIONS = ['members', 'roles', 'policies', 'destinations'];
 // Deliberately NOT `user:{username}:tenants`: the gateway backfills its user
 // index from a `user:*` key scan, so anything hung off that prefix gets read
 // back as a username. Its own namespace keeps the two apart.
@@ -57,6 +78,11 @@ const tenantRequestsKey = (id) => `requests:tenant:${id}`;
 // subject fragments (t:{id}:{role}), so ':' and '/' must be impossible.
 const TENANT_ID_RE = /^[a-z0-9][a-z0-9_-]{1,62}$/;
 const ROLE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/;
+// Usernames are Redis key fragments (user:{username}) and URL path segments.
+// They are never Casbin subjects (see userSubject below), so this is about
+// keeping keys and paths unambiguous, not about authorization. Wide enough for
+// an email address; no ':' '/' ',' or whitespace.
+const USERNAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@+-]{1,63}$/;
 
 // Path segments the gateway already routes itself — a tenant with one of these
 // ids would shadow a real endpoint.
@@ -83,11 +109,39 @@ function validateRoleName(role) {
   return null;
 }
 
+function validateUsername(username) {
+  if (typeof username !== 'string' || !USERNAME_RE.test(username)) {
+    return 'Username must be 2-64 chars: letters, digits, ".", "_", "-", "+" or "@", starting with a letter or digit';
+  }
+  return null;
+}
+
 // --- CASBIN SUBJECT NAMING ---
+
+const USER_SUBJECT_PREFIX = 'u:';
+const PLATFORM_ROLE_PREFIX = 'r:';
+
+/** The Casbin subject for an account. Built from its immutable id, not its name. */
+const userSubject = (userId) => `${USER_SUBJECT_PREFIX}${userId}`;
+
+/** Inverse of userSubject. Returns null for anything that is not a user subject. */
+function parseUserSubject(subject) {
+  if (typeof subject !== 'string' || !subject.startsWith(USER_SUBJECT_PREFIX)) return null;
+  return subject.slice(USER_SUBJECT_PREFIX.length) || null;
+}
+
+/** The Casbin subject for a platform (non-tenant) role. */
+const platformRoleSubject = (role) => `${PLATFORM_ROLE_PREFIX}${role}`;
+
+/** Inverse of platformRoleSubject. Returns null for anything that is not a platform role. */
+function parsePlatformRole(subject) {
+  if (typeof subject !== 'string' || !subject.startsWith(PLATFORM_ROLE_PREFIX)) return null;
+  return subject.slice(PLATFORM_ROLE_PREFIX.length) || null;
+}
 
 const qualifyRole = (tenantId, role) => `t:${tenantId}:${role}`;
 
-/** Inverse of qualifyRole. Returns null for platform-namespace subjects. */
+/** Inverse of qualifyRole. Returns null for user and platform-role subjects. */
 function parseQualifiedRole(subject) {
   if (typeof subject !== 'string' || !subject.startsWith('t:')) return null;
   const sep = subject.indexOf(':', 2);
@@ -110,14 +164,36 @@ function ownsResource(tenantId, resource) {
 
 // --- FACTORY ---
 
+/** A tenant's resource attributes, as stored (JSON) -> an object; {} if unset or unreadable. */
+function parseAttributes(raw) {
+  try {
+    const parsed = JSON.parse(raw || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 /**
  * @param {object} deps
  * @param {import('ioredis').Redis} deps.redis
  * @param {(fn: Function) => Promise<any>} deps.withCasbin  serialises model access
  * @param {() => object} deps.getEnforcer                   resolves the live enforcer
+ * @param {(username: string) => Promise<string|null>} deps.userSubjectFor
+ *   resolves an account's Casbin subject (u:{id}), or null if there is no such
+ *   account. Membership Sets are keyed by username; Casbin rows never are.
+ * @param {(subject: string, resource: string, action: string, condition: object|null) => Promise<boolean>} deps.addPolicyRow
+ *   adds one policy row, stored together with its attribute condition if it has one
  */
-function createTenancy({ redis, withCasbin, getEnforcer }) {
+function createTenancy({ redis, withCasbin, getEnforcer, userSubjectFor, addPolicyRow }) {
   const casbin = (fn) => withCasbin(() => fn(getEnforcer()));
+
+  /** Every Casbin subject this account holds; none if the account is gone. */
+  async function subjectsHeldBy(username) {
+    const subject = await userSubjectFor(username);
+    if (!subject) return [];
+    return casbin((e) => e.getRolesForUser(subject));
+  }
 
   // --- TENANT CRUD ---
 
@@ -129,6 +205,8 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
       description: hash.description || '',
       baseUrl: hash.baseUrl || '',
       owner: hash.owner || null,
+      // What attribute conditions see as resource.* for this tenant's service.
+      attributes: parseAttributes(hash.attributes),
       status: hash.status || 'active',
       source: hash.source || 'manual',
       createdAt: hash.createdAt,
@@ -221,6 +299,7 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
     for (const key of ['displayName', 'description', 'baseUrl', 'status', 'owner']) {
       if (patch[key] !== undefined) fields[key] = patch[key] === null ? '' : String(patch[key]);
     }
+    if (patch.attributes !== undefined) fields.attributes = JSON.stringify(patch.attributes);
     await redis.hset(tenantKey(id), fields);
     return getTenant(id);
   }
@@ -251,6 +330,7 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
     const pipeline = redis.pipeline();
     for (const username of members) pipeline.srem(userTenantsKey(username), id);
     pipeline.del(tenantKey(id), tenantRolesKey(id), tenantMembersKey(id), tenantAdminsKey(id), tenantRequestsKey(id));
+    pipeline.del(...TENANT_PERMISSIONS.map((permission) => tenantPermissionKey(id, permission)));
     pipeline.srem(TENANTS_INDEX_KEY, id);
     await pipeline.exec();
   }
@@ -280,7 +360,7 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
 
   /** Role names this user holds *within* one tenant, unqualified. */
   async function getUserTenantRoles(id, username) {
-    const all = await casbin((e) => e.getRolesForUser(username));
+    const all = await subjectsHeldBy(username);
     return all
       .map(parseQualifiedRole)
       .filter((parsed) => parsed && parsed.tenantId === id)
@@ -290,7 +370,7 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
 
   /** Every tenant role this user holds, grouped by tenant id. */
   async function getUserRolesByTenant(username) {
-    const all = await casbin((e) => e.getRolesForUser(username));
+    const all = await subjectsHeldBy(username);
     const byTenant = {};
     for (const subject of all) {
       const parsed = parseQualifiedRole(subject);
@@ -302,16 +382,24 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
   }
 
   async function grantTenantRole(id, username, role) {
-    await casbin((e) => e.addRoleForUser(username, qualifyRole(id, role)));
+    const subject = await userSubjectFor(username);
+    // Refuse rather than fall back to the name: a grant written against a
+    // username would attach to whoever holds that name next.
+    if (!subject) throw new Error(`Cannot grant a role to '${username}': no such account`);
+    await casbin((e) => e.addRoleForUser(subject, qualifyRole(id, role)));
     await addTenantMember(id, username);
   }
 
   async function revokeTenantRole(id, username, role) {
-    return casbin((e) => e.deleteRoleForUser(username, qualifyRole(id, role)));
+    const subject = await userSubjectFor(username);
+    if (!subject) return false;
+    return casbin((e) => e.deleteRoleForUser(subject, qualifyRole(id, role)));
   }
 
   async function hasTenantRole(id, username, role) {
-    return casbin((e) => e.hasRoleForUser(username, qualifyRole(id, role)));
+    const subject = await userSubjectFor(username);
+    if (!subject) return false;
+    return casbin((e) => e.hasRoleForUser(subject, qualifyRole(id, role)));
   }
 
   // --- MEMBERSHIP ---
@@ -337,6 +425,7 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
     }
     await redis.srem(tenantMembersKey(id), username);
     await redis.srem(tenantAdminsKey(id), username);
+    for (const permission of TENANT_PERMISSIONS) await redis.srem(tenantPermissionKey(id, permission), username);
     await redis.srem(userTenantsKey(username), id);
   }
 
@@ -347,6 +436,7 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
     for (const id of ids) {
       pipeline.srem(tenantMembersKey(id), username);
       pipeline.srem(tenantAdminsKey(id), username);
+      for (const permission of TENANT_PERMISSIONS) pipeline.srem(tenantPermissionKey(id, permission), username);
     }
     pipeline.del(userTenantsKey(username));
     await pipeline.exec();
@@ -379,6 +469,41 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
     await redis.srem(tenantAdminsKey(id), username);
   }
 
+  // --- DELEGATED PERMISSIONS ---
+  //
+  // Same storage decision as the admin set above, for the same reason: these
+  // are API-surface permissions, resolved from Redis on every call so that
+  // taking one away takes effect at once on every gateway instance.
+
+  /** The permissions this user has been given individually (not counting full admin). */
+  async function getDelegatedPermissions(id, username) {
+    const held = await Promise.all(
+      TENANT_PERMISSIONS.map((permission) => redis.sismember(tenantPermissionKey(id, permission), username)),
+    );
+    return TENANT_PERMISSIONS.filter((_, i) => held[i] === 1);
+  }
+
+  /** What this user may actually do here: everything if a full admin, else what was delegated. */
+  async function getTenantPermissions(id, username) {
+    if (await isTenantAdmin(id, username)) return [...TENANT_PERMISSIONS];
+    return getDelegatedPermissions(id, username);
+  }
+
+  /**
+   * Replaces the user's delegated permissions with exactly `permissions`.
+   * @returns {Promise<{ granted: string[], revoked: string[] }>}
+   */
+  async function setDelegatedPermissions(id, username, permissions) {
+    const before = await getDelegatedPermissions(id, username);
+    const granted = permissions.filter((permission) => !before.includes(permission));
+    const revoked = before.filter((permission) => !permissions.includes(permission));
+
+    await addTenantMember(id, username);
+    for (const permission of granted) await redis.sadd(tenantPermissionKey(id, permission), username);
+    for (const permission of revoked) await redis.srem(tenantPermissionKey(id, permission), username);
+    return { granted, revoked };
+  }
+
   /** Tenants this user belongs to, each annotated with their standing in it. */
   async function listTenantsForUser(username) {
     const ids = await redis.smembers(userTenantsKey(username));
@@ -390,6 +515,7 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
         ...tenant,
         roles: rolesByTenant[id] || [],
         isAdmin: await isTenantAdmin(id, username),
+        permissions: await getTenantPermissions(id, username),
       };
     }));
     return tenants.filter(Boolean).sort((a, b) => a.id.localeCompare(b.id));
@@ -409,8 +535,8 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
       .map((p) => ({ ...p, role: parseQualifiedRole(p.subject).role }));
   }
 
-  async function addTenantPolicy(id, role, resource, action) {
-    return casbin((e) => e.addPolicy(qualifyRole(id, role), resource, action));
+  async function addTenantPolicy(id, role, resource, action, condition = null) {
+    return addPolicyRow(qualifyRole(id, role), resource, action, condition);
   }
 
   async function removeTenantPolicy(id, role, resource, action) {
@@ -420,8 +546,9 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
   return {
     // keys + naming (exported so callers can build their own queries)
     TENANTS_INDEX_KEY, tenantRequestsKey, userTenantsKey,
+    userSubject, parseUserSubject, platformRoleSubject, parsePlatformRole,
     qualifyRole, parseQualifiedRole, ownsResource,
-    validateTenantId, validateRoleName, RESERVED_TENANT_IDS, DEFAULT_TENANT_ROLE,
+    validateTenantId, validateRoleName, validateUsername, RESERVED_TENANT_IDS, DEFAULT_TENANT_ROLE,
 
     // tenants
     tenantExists, getTenant, listTenants, listTenantIds,
@@ -439,6 +566,9 @@ function createTenancy({ redis, withCasbin, getEnforcer }) {
     // admins
     listTenantAdmins, isTenantAdmin, addTenantAdmin, removeTenantAdmin,
 
+    // delegated permissions
+    TENANT_PERMISSIONS, getDelegatedPermissions, getTenantPermissions, setDelegatedPermissions,
+
     // policies
     listTenantPolicies, addTenantPolicy, removeTenantPolicy,
   };
@@ -450,9 +580,15 @@ module.exports = {
   // service names with the same rules the gateway validates tenant ids).
   validateTenantId,
   validateRoleName,
+  validateUsername,
+  userSubject,
+  parseUserSubject,
+  platformRoleSubject,
+  parsePlatformRole,
   qualifyRole,
   parseQualifiedRole,
   ownsResource,
   RESERVED_TENANT_IDS,
   DEFAULT_TENANT_ROLE,
+  TENANT_PERMISSIONS,
 };

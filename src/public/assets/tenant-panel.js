@@ -7,9 +7,11 @@
  *
  * It is shared verbatim by the platform admin console and the tenant owner's
  * console, because they do the same job on the same object — the only
- * difference is which tenants each is allowed to open, and the API already
- * decides that (requireTenantAdmin passes the platform admin for every
- * tenant, and a tenant admin only for their own). Writing this twice would
+ * difference is which tenants each is allowed to open, and which parts of one
+ * they may change. The API decides both: GET /tenants/:id says which of the
+ * four administrative permissions (members, roles, policies, destinations)
+ * the signed-in account holds here, and this component offers the controls
+ * for those and no others. Writing this twice would
  * guarantee the two drift, and "the admin panel can do something the owner's
  * panel cannot" is exactly the kind of drift that turns into a support ticket.
  */
@@ -18,6 +20,7 @@ import { esc, chips, badge, ok, err, parseList, relTime, confirmDanger } from '.
 import { runAccessTest } from './access-test.js';
 
 const ACTIONS = ['get', 'post', 'put', 'patch', 'delete'];
+const PERMISSIONS = ['members', 'roles', 'policies', 'destinations'];
 
 export class TenantPanel {
   /**
@@ -39,11 +42,33 @@ export class TenantPanel {
       if (e.target.matches('[data-request-filter]')) {
         this.state.requestFilter = e.target.value;
         this.loadRequests().then(() => this.render());
+      } else if (e.target.matches('input[data-perm]')) {
+        this.savePermissions(e.target.dataset.user);
       }
     });
   }
 
   get id() { return this.state.tenant?.id; }
+
+  /** May the signed-in account do this part of administering the tenant? */
+  can(permission) { return (this.state.tenant?.permissions || []).includes(permission); }
+  /** The member list and the request queue are for whoever manages members or roles. */
+  get seesUsers() { return this.can('members') || this.can('roles'); }
+
+  /** Sends exactly the boxes that are ticked for this user. */
+  async savePermissions(username) {
+    const permissions = [...this.mount.querySelectorAll('input[data-perm]:checked')]
+      .filter((box) => box.dataset.user === username)
+      .map((box) => box.dataset.perm);
+    try {
+      const res = await this.api(
+        `/tenants/${encodeURIComponent(this.id)}/users/${encodeURIComponent(username)}/permissions`,
+        { method: 'PUT', body: { permissions } },
+      );
+      ok(res.message);
+    } catch { /* already surfaced by api() */ }
+    await this.refresh();
+  }
   get endpoints() { return this.state.tenant?.service?.endpoints || []; }
 
   async load(tenantId) {
@@ -52,12 +77,12 @@ export class TenantPanel {
     const [roles, policies, users] = await Promise.all([
       this.api(`/tenants/${t}/roles`),
       this.api(`/tenants/${t}/policies`),
-      this.api(`/tenants/${t}/users`),
+      this.seesUsers ? this.api(`/tenants/${t}/users`) : { users: [] },
     ]);
     this.state.roles = roles.roles;
     this.state.policies = policies.policies;
     this.state.users = users.users;
-    await this.loadRequests();
+    if (this.seesUsers) await this.loadRequests(); else this.state.requests = [];
     this.render();
   }
 
@@ -87,8 +112,8 @@ export class TenantPanel {
       this.renderService(),
       this.renderRoles(),
       this.renderPolicies(),
-      this.renderUsers(),
-      this.renderRequests(),
+      this.seesUsers ? this.renderUsers() : '',
+      this.seesUsers ? this.renderRequests() : '',
     ].join('');
   }
 
@@ -110,7 +135,7 @@ export class TenantPanel {
           <p class="empty">No service registered yet — give it a base URL below and it becomes routable.</p>
         `}
 
-        <form data-form="service" class="grid" style="margin-top:14px">
+        ${this.can('destinations') ? `<form data-form="service" class="grid" style="margin-top:14px">
           <label class="field">Base URL
             <input name="baseUrl" placeholder="http://localhost:9090" value="${esc(s?.baseUrl || '')}">
           </label>
@@ -125,14 +150,15 @@ export class TenantPanel {
           </label>
           <div class="row" style="grid-column:1/-1">
             <button type="submit">Save service</button>
-            <button type="button" class="ghost" data-act="toggle-status">
+            ${s?.catalogUrl ? '<button type="button" class="ghost" data-act="sync-catalog" title="Re-read endpoints, version and owner from the catalog URL">Re-read from catalog</button>' : ''}
+            ${t.isAdmin ? `<button type="button" class="ghost" data-act="toggle-status">
               ${t.status === 'active' ? 'Suspend tenant' : 'Reactivate tenant'}
             </button>
             <span class="muted">${t.status === 'active'
               ? 'Suspending stops all gateway traffic immediately, without touching policies.'
-              : 'Suspended — the gateway is refusing every request to this service.'}</span>
+              : 'Suspended — the gateway is refusing every request to this service.'}</span>` : ''}
           </div>
-        </form>
+        </form>` : ''}
       </div>`;
   }
 
@@ -144,7 +170,7 @@ export class TenantPanel {
         <td>${r.policies.length
           ? r.policies.map((p) => `<span class="chip navy">${esc(p.action)} ${esc(p.resource)}</span>`).join('')
           : '<span class="muted">reaches nothing</span>'}</td>
-        <td class="nowrap"><button class="danger tiny" data-act="del-role" data-role="${esc(r.role)}">Delete</button></td>
+        <td class="nowrap">${this.can('roles') ? `<button class="danger tiny" data-act="del-role" data-role="${esc(r.role)}">Delete</button>` : ''}</td>
       </tr>`).join('');
 
     return `
@@ -156,11 +182,11 @@ export class TenantPanel {
             <tbody>${rows || '<tr><td colspan="4" class="empty">No roles yet.</td></tr>'}</tbody>
           </table>
         </div>
-        <form data-form="role" class="row" style="margin-top:12px">
+        ${this.can('roles') ? `<form data-form="role" class="row" style="margin-top:12px">
           <input name="role" placeholder="engineer" required>
           <button type="submit">Add role</button>
           <span class="muted">Private to this tenant — another tenant may use the same name.</span>
-        </form>
+        </form>` : ''}
       </div>`;
   }
 
@@ -170,8 +196,8 @@ export class TenantPanel {
         <td class="mono">${esc(p.role)}</td>
         <td><code>${esc(p.resource)}</code></td>
         <td><span class="badge info plain">${esc(p.action)}</span></td>
-        <td class="nowrap"><button class="danger tiny" data-act="del-policy"
-          data-role="${esc(p.role)}" data-resource="${esc(p.resource)}" data-action="${esc(p.action)}">Remove</button></td>
+        <td class="nowrap">${p.condition ? `<span class="muted" title="${esc(JSON.stringify(p.condition))}">conditional</span> ` : ''}${this.can('policies') ? `<button class="danger tiny" data-act="del-policy"
+          data-role="${esc(p.role)}" data-resource="${esc(p.resource)}" data-action="${esc(p.action)}">Remove</button>` : ''}</td>
       </tr>`).join('');
 
     // Offer the service's real endpoints plus a catch-all, so a policy cannot
@@ -187,13 +213,13 @@ export class TenantPanel {
             <tbody>${rows || '<tr><td colspan="4" class="empty">No policies — nobody can reach this service yet.</td></tr>'}</tbody>
           </table>
         </div>
-        <form data-form="policy" class="row" style="margin-top:12px">
+        ${this.can('policies') ? `<form data-form="policy" class="row" style="margin-top:12px">
           <select name="role" required>${this.state.roles.map((r) => `<option value="${esc(r.role)}">${esc(r.role)}</option>`).join('')}</select>
           <select name="resource" required>${paths.map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}</select>
           <select name="action">${ACTIONS.map((a) => `<option value="${a}">${a}</option>`).join('')}</select>
           <button type="submit" ${this.state.roles.length ? '' : 'disabled'}>Allow</button>
           ${this.state.roles.length ? '' : '<span class="muted">Define a role first.</span>'}
-        </form>
+        </form>` : ''}
       </div>`;
   }
 
@@ -210,14 +236,18 @@ export class TenantPanel {
             ${u.isAdmin && t.owner !== u.username ? badge('info', 'admin') : ''}
           </div>
         </td>
-        <td>${chips(u.roles, { removable: true, data: { act: 'revoke', user: u.username }, valueAttr: 'role', cls: 'navy' })
+        <td>${chips(u.roles, { removable: this.can('roles'), data: { act: 'revoke', user: u.username }, valueAttr: 'role', cls: 'navy' })
           || '<span class="muted">no role</span>'}</td>
+        <td class="nowrap">${u.isAdmin
+          ? '<span class="muted">everything</span>'
+          : PERMISSIONS.map((p) => `<label style="margin-right:8px"><input type="checkbox" data-perm="${p}" data-user="${esc(u.username)}"
+              ${(u.permissions || []).includes(p) ? 'checked' : ''} ${t.isAdmin ? '' : 'disabled'}> ${p}</label>`).join('')}</td>
         <td>
           <div class="row">
             <select data-grant-for="${esc(u.username)}"><option value="">grant role…</option>${roleOptions}</select>
             <button class="ghost tiny" data-act="grant" data-user="${esc(u.username)}">Grant</button>
             <button class="ghost tiny" data-act="test" data-user="${esc(u.username)}">Test</button>
-            ${u.isAdmin
+            ${!t.isAdmin ? '' : u.isAdmin
               ? `<button class="ghost tiny" data-act="demote" data-user="${esc(u.username)}">Remove admin</button>`
               : `<button class="ghost tiny" data-act="promote" data-user="${esc(u.username)}">Make admin</button>`}
             <button class="danger tiny" data-act="remove-user" data-user="${esc(u.username)}">Remove</button>
@@ -230,8 +260,8 @@ export class TenantPanel {
         <h3>Users</h3>
         <div class="scroll-x">
           <table>
-            <thead><tr><th>User</th><th>Roles here</th><th></th></tr></thead>
-            <tbody>${rows || '<tr><td colspan="3" class="empty">Nobody yet.</td></tr>'}</tbody>
+            <thead><tr><th>User</th><th>Roles here</th><th>May manage</th><th></th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="4" class="empty">Nobody yet.</td></tr>'}</tbody>
           </table>
         </div>
         <form data-form="add-user" class="row" style="margin-top:12px">
@@ -348,6 +378,11 @@ export class TenantPanel {
           ok(`Tenant ${next}`);
           break;
         }
+        case 'sync-catalog':
+          // The registry no longer copies a service's catalog on a timer;
+          // adopting what it advertises is something its admin asks for.
+          ok((await this.api(`/tenants/${t}/service`, { method: 'PATCH', body: { syncFromCatalog: true } })).message);
+          break;
         case 'del-role':
           if (!confirmDanger(`Delete role '${btn.dataset.role}'?\n\nIts policies and every grant of it go too.`)) return;
           await this.api(`/tenants/${t}/roles/${encodeURIComponent(btn.dataset.role)}`, { method: 'DELETE' });
@@ -416,11 +451,11 @@ export class TenantPanel {
   }
 
   /**
-   * The access test answers "did what I just configure actually work" — it
-   * mints a short-lived token for the user and calls the gateway over
-   * loopback, so it exercises the real authenticate -> enforce -> proxy path
-   * rather than re-reading the policy table that was just written. The
-   * inspector shows the whole exchange; see assets/access-test.js.
+   * The access test answers "did what I just configure actually work". The
+   * gateway evaluates it with the same decision function its proxy route
+   * uses, without issuing a token for the member or calling the service, so
+   * testing someone never puts their credential in anyone else's hands. See
+   * assets/access-test.js.
    */
   async showAccessTest(username) {
     await runAccessTest(this.api, {

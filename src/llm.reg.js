@@ -4,8 +4,10 @@
  * Run with: node llm.js
  */
 
+require('./local-env'); // .env, when run by hand
 const express = require('express');
 const { createLogger } = require('./logger');
+const { createRegistryClient } = require('./registry-client');
 
 const log = createLogger('llm');
 const app = express();
@@ -55,71 +57,30 @@ app.get('/llm/claude', (req, res) =>
   }),
 );
 
-// --- SELF-REGISTRATION LOGIC ---
-async function registerWithRegistry(retries = 5, delayMs = 2000) {
-  const { default: fetch } = await import('node-fetch');
+// --- REGISTRATION ---
+// Registering, renewing on restart, pushing a changed catalog and
+// deregistering are the registry client's job (see registry-client.js); this
+// service only says what it is.
+const registry = createRegistryClient({ registryUrl: REGISTRY_URL, log });
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      console.log(
-        `[LLM] Registering with Service Registry (attempt ${attempt}/${retries})...`,
-      );
-
-      const response = await fetch(`${REGISTRY_URL}/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: SERVICE_CATALOG.name,
-          baseUrl: SERVICE_CATALOG.baseUrl,
-          // Tell registry where to fetch our catalog for health checks
-          catalogUrl: `${SERVICE_CATALOG.baseUrl}/catalog`,
-          owner: SERVICE_CATALOG.owner,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || `HTTP ${response.status}`);
-      }
-
-      log.audit('registration', `Registered with Service Registry`, {
-        version: SERVICE_CATALOG.version, endpoints: SERVICE_CATALOG.endpoints,
-      });
-      return; // Success, exit retry loop
-    } catch (err) {
-      log.warn('registration', `Registration attempt ${attempt} failed: ${err.message}`, { attempt });
-
-      if (attempt < retries) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-      } else {
-        // Non-fatal: service still runs, registry just won't know about it yet
-        log.error('registration', `All registration attempts failed. Running unregistered.`);
-      }
-    }
-  }
-}
+const announce = () => registry.announce({
+  name: SERVICE_CATALOG.name,
+  baseUrl: SERVICE_CATALOG.baseUrl,
+  // Where the registry probes this service for liveness
+  catalogUrl: `${SERVICE_CATALOG.baseUrl}/catalog`,
+  owner: SERVICE_CATALOG.owner,
+  version: SERVICE_CATALOG.version,
+  endpoints: SERVICE_CATALOG.endpoints,
+});
 
 // --- GRACEFUL DEREGISTRATION ON SHUTDOWN ---
-async function deregisterFromRegistry() {
-  try {
-    const { default: fetch } = await import('node-fetch');
-    await fetch(`${REGISTRY_URL}/services/${SERVICE_CATALOG.name}`, {
-      method: 'DELETE',
-    });
-    log.audit('registration', 'Deregistered from Service Registry');
-  } catch (err) {
-    log.warn('registration', `Could not deregister: ${err.message}`);
-  }
-}
-
 process.on('SIGINT', async () => {
-  await deregisterFromRegistry();
+  await registry.deregister(SERVICE_CATALOG.name);
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  await deregisterFromRegistry();
+  await registry.deregister(SERVICE_CATALOG.name);
   process.exit(0);
 });
 
@@ -128,5 +89,5 @@ app.listen(PORT, async () => {
   console.log(`\n🧠 LLM Mock Server running on port ${PORT}`);
   console.log(`   Catalog: http://localhost:${PORT}/catalog`);
   // Register after server is fully listening
-  await registerWithRegistry();
+  await announce();
 });

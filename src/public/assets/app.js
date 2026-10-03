@@ -51,9 +51,19 @@ export function session(storageKey) {
  * into "request failed" would throw away the most useful thing they say.
  * Any `warnings` array in a response is shown too, since the registry uses it
  * to report what it could not verify rather than failing outright.
+ *
+ * A SESSION_ENDED answer means the token is no longer good — signed out
+ * elsewhere, password changed, account suspended, or access taken away, any
+ * of which ends every session the account has. `onSessionEnded` lets the page
+ * go back to the sign-in screen instead of failing call after call.
+ *
+ * @param {object} sess
+ * @param {object} [hooks]
+ * @param {() => void} [hooks.onSessionEnded]
  */
-export function makeApi(sess) {
+export function makeApi(sess, { onSessionEnded } = {}) {
   return async function api(path, options = {}) {
+    const sentToken = sess.token;
     const res = await fetch(path, {
       ...options,
       headers: {
@@ -71,6 +81,9 @@ export function makeApi(sess) {
     if (!res.ok) {
       const message = body?.error || `${res.status} ${res.statusText}`;
       err(body?.hint ? `${message} — ${body.hint}` : message);
+      // Only if the token that was refused is still the current one: a late
+      // reply to a call made before signing out must not sign anyone out.
+      if (body?.code === 'SESSION_ENDED' && sentToken === sess.token && onSessionEnded) onSessionEnded();
       const e = new Error(message);
       e.status = res.status;
       e.body = body;
@@ -150,8 +163,15 @@ export function relTime(iso) {
  * @param {{ isPlatformAdmin?: boolean }} me       response from GET /me
  * @param {Array<{ isAdmin?: boolean }>} myTenants response from GET /tenants/mine
  */
+/**
+ * Does this account administer any part of the tenant? Administration is four
+ * separate grants now (members, roles, policies, destinations), so "is an
+ * admin" is no longer the whole question.
+ */
+export const administers = (tenant) => Boolean(tenant.isAdmin) || (tenant.permissions || []).length > 0;
+
 export function entitledViews(me, myTenants = []) {
-  const adminOf = myTenants.filter((t) => t.isAdmin);
+  const adminOf = myTenants.filter(administers);
   const views = [{ id: 'access', label: 'My access' }];
 
   // A platform admin manages every tenant from the platform view, so a second

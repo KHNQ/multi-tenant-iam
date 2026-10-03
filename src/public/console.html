@@ -22,17 +22,47 @@
      server says you are, not on which URL you happened to open. ── -->
 <div id="auth" class="card auth">
   <div class="tabs">
-    <button id="tab-login" class="on">Log in</button>
+    <button id="tab-login" class="on">Sign in</button>
     <button id="tab-signup">Sign up</button>
   </div>
-  <input id="u" placeholder="username" autocomplete="username">
-  <input id="p" placeholder="password" type="password" autocomplete="current-password">
-  <button id="go">Log in</button>
+  <!-- Signing in happens on the gateway's own sign-in page (OpenID Connect,
+       authorization code + PKCE): this page never sees a password. Only
+       creating an account asks for one here. -->
+  <input id="u" placeholder="choose a username" autocomplete="username" hidden>
+  <input id="p" placeholder="choose a password (8+ characters)" type="password" autocomplete="new-password" hidden>
+  <button id="go">Sign in</button>
+  <button id="forgot-link" class="ghost">Forgot your password?</button>
   <p class="muted" style="margin:2px 0 0">
     One account for the whole gateway. Sign in and you get exactly the consoles you
     are entitled to — request access to a service, run a service you own, or
     administer the platform.
   </p>
+</div>
+
+<!-- ── "I have forgotten my password." The answer is the same whether or not
+     the account exists. ── -->
+<div id="forgot" class="card auth" hidden>
+  <h2>Recover your password</h2>
+  <p class="muted" style="margin:0">
+    Enter your username. If the account exists, recovery instructions are sent through
+    your organisation's usual channel — or ask an administrator for a recovery link.
+  </p>
+  <input id="fu" placeholder="username" autocomplete="username">
+  <button id="forgot-go">Send recovery instructions</button>
+  <button id="forgot-back" class="ghost">Back to sign in</button>
+</div>
+
+<!-- ── Reached from a recovery link (…/console#recover=TOKEN). The token is in
+     the fragment, which the browser sends to no server until this form is
+     submitted. ── -->
+<div id="recover" class="card auth" hidden>
+  <h2>Choose a new password</h2>
+  <p class="muted" style="margin:0">
+    This link works once. Setting a new password signs the account out everywhere.
+  </p>
+  <input id="rp" placeholder="new password (8+ characters)" type="password" autocomplete="new-password">
+  <input id="rp2" placeholder="repeat new password" type="password" autocomplete="new-password">
+  <button id="recover-go">Set password</button>
 </div>
 
 <main id="app" hidden>
@@ -50,7 +80,7 @@
       <p class="hint" style="margin-top:0">
         The test calls every endpoint on the gateway with your own token and shows the whole
         exchange — the claims the gateway reads, the request it sent, and the status and body
-        that came back. It is the same probe a service owner runs against their members.
+        that came back.
       </p>
       <div id="mine"></div>
     </section>
@@ -101,8 +131,8 @@
           <p class="hint">
             Registering creates a tenant named after your service and makes you its administrator.
             <strong>The service does not have to be running yet</strong> — if the catalog URL can't
-            be reached it is registered from what you type here, and the registry picks up live
-            metadata as soon as it comes online.
+            be reached it is registered from what you type here. Its endpoints stay as you list
+            them until you change them, or re-read them from its catalog once it is online.
           </p>
         </div>
         <button id="reg-toggle" class="ghost">+ New service</button>
@@ -196,7 +226,7 @@
         granted a role in. Tenant membership is managed inside each tenant above.</p>
       <div class="scroll-x">
         <table>
-          <thead><tr><th>Username</th><th>Primary role</th><th>Subjects held</th><th></th></tr></thead>
+          <thead><tr><th>Username</th><th>Primary role</th><th>Status</th><th>Subjects held</th><th></th></tr></thead>
           <tbody id="users"></tbody>
         </table>
       </div>
@@ -262,7 +292,7 @@
 <script type="module">
 import {
   esc, chips, badge, ok, err, session, makeApi, parseList, relTime, confirmDanger,
-  entitledViews, defaultView,
+  entitledViews, defaultView, administers,
 } from '/assets/app.js';
 import { TenantPanel } from '/assets/tenant-panel.js';
 import { accessTestModalHtml, wireAccessTestModal, runAccessTest } from '/assets/access-test.js';
@@ -274,7 +304,7 @@ wireAccessTestModal();
 // separate logins for the same account, which is what made this feel like
 // three products instead of one.
 const sess = session('iam_token');
-const api = makeApi(sess);
+const api = makeApi(sess, { onSessionEnded: () => signedOut() });
 const $ = (id) => document.getElementById(id);
 
 const state = {
@@ -333,46 +363,178 @@ function setMode(mode) {
   state.mode = mode;
   $('tab-login').classList.toggle('on', mode === 'login');
   $('tab-signup').classList.toggle('on', mode === 'signup');
-  $('go').textContent = mode === 'login' ? 'Log in' : 'Sign up';
+  $('u').hidden = mode === 'login';
+  $('p').hidden = mode === 'login';
+  $('forgot-link').hidden = mode !== 'login';
+  $('go').textContent = mode === 'login' ? 'Sign in' : 'Create account';
 }
 $('tab-login').addEventListener('click', () => setMode('login'));
 $('tab-signup').addEventListener('click', () => setMode('signup'));
 
 async function submitAuth() {
-  const username = $('u').value.trim();
-  const password = $('p').value;
-  if (!username || !password) return err('Enter a username and password');
-
   if (state.mode === 'signup') {
+    const username = $('u').value.trim();
+    const password = $('p').value;
+    if (!username || !password) return err('Choose a username and a password');
+
     const r = await fetch('/auth/signup', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     });
     const b = await r.json().catch(() => ({}));
     if (!r.ok) return err(b.error || 'Signup failed');
-    ok('Account created.');
+    $('u').value = '';
+    $('p').value = '';
+    ok('Account created — sign in to continue.');
+  }
+  await startSignIn();
+}
+
+// ── signing in: OpenID Connect, authorization code + PKCE ────────────────
+//
+// The console is an ordinary OIDC client of the gateway ("iam-console"). It
+// sends the browser to the gateway's sign-in page and gets back a one-time
+// code, which it trades for a token together with a secret it made up before
+// leaving (the PKCE verifier). The password is typed into the gateway's page,
+// never into this one, and a code that leaked on the way would be useless
+// without the verifier, which never leaves this tab.
+
+const OIDC_CLIENT_ID = 'iam-console';
+const OIDC_PENDING_KEY = 'iam_oidc_pending';
+
+const base64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes)))
+  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const randomString = (bytes) => base64url(crypto.getRandomValues(new Uint8Array(bytes)));
+
+async function oidcConfig() {
+  const res = await fetch('/.well-known/openid-configuration');
+  if (!res.ok) throw new Error('The gateway did not return its OpenID configuration');
+  return res.json();
+}
+
+async function startSignIn() {
+  try {
+    if (!crypto.subtle) throw new Error('Signing in needs a secure page: open the console over HTTPS (or on localhost)');
+    const config = await oidcConfig();
+    // The redirect has to come back to the origin the gateway is configured
+    // as. Opened under another name (an IP, a different port), the stored
+    // verifier would not be there when it returned.
+    if (new URL(config.issuer).origin !== location.origin) {
+      throw new Error(`Open the console at ${config.issuer}/console to sign in`);
+    }
+
+    const pending = { verifier: randomString(48), state: randomString(24), nonce: randomString(24) };
+    sessionStorage.setItem(OIDC_PENDING_KEY, JSON.stringify(pending));
+    const challenge = base64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pending.verifier)));
+
+    const target = new URL(config.authorization_endpoint);
+    target.search = new URLSearchParams({
+      response_type: 'code',
+      client_id: OIDC_CLIENT_ID,
+      redirect_uri: `${config.issuer}/console`,
+      scope: 'openid profile',
+      state: pending.state,
+      nonce: pending.nonce,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    });
+    location.assign(target);
+  } catch (e) {
+    err(e.message);
+  }
+}
+
+/** Called on load when the gateway has sent the browser back with ?code=…&state=… */
+async function finishSignIn(params) {
+  const pending = JSON.parse(sessionStorage.getItem(OIDC_PENDING_KEY) || 'null');
+  sessionStorage.removeItem(OIDC_PENDING_KEY);
+  // Whatever happens next, the code must not stay in the address bar or history.
+  history.replaceState(null, '', location.pathname);
+
+  if (params.get('error')) return err(params.get('error_description') || params.get('error'));
+  if (!pending || params.get('state') !== pending.state) {
+    return err('That sign-in did not start in this tab. Sign in again.');
   }
 
-  const res = await fetch('/auth/login', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
+  const config = await oidcConfig();
+  const res = await fetch(config.token_endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: params.get('code'),
+      redirect_uri: `${config.issuer}/console`,
+      client_id: OIDC_CLIENT_ID,
+      code_verifier: pending.verifier,
+    }),
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) return err(body.error || 'Login failed');
+  if (!res.ok) return err(body.error_description || 'Sign-in could not be completed');
 
-  sess.token = body.token;
-  $('u').value = '';
-  $('p').value = '';
+  // The ID token must be the answer to THIS request.
+  const claims = JSON.parse(atob(body.id_token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+  if (claims.nonce !== pending.nonce) return err('The sign-in response did not match the request. Sign in again.');
+
+  sess.token = body.access_token;
   await enter();
 }
 
+// ── password recovery ───────────────────────────────────────────────────
+
+function showCard(id) {
+  for (const card of ['auth', 'forgot', 'recover']) $(card).hidden = card !== id;
+}
+
+$('forgot-link').addEventListener('click', () => showCard('forgot'));
+$('forgot-back').addEventListener('click', () => showCard('auth'));
+
+$('forgot-go').addEventListener('click', async () => {
+  const username = $('fu').value.trim();
+  if (!username) return err('Enter your username');
+  const res = await fetch('/auth/password-recovery', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) return err(body.error || 'The request could not be sent');
+  $('fu').value = '';
+  ok(body.message);
+  showCard('auth');
+});
+
+let recoveryToken = null;
+
+$('recover-go').addEventListener('click', async () => {
+  const next = $('rp').value;
+  if (!next) return err('Enter a new password');
+  if (next !== $('rp2').value) return err('The two passwords do not match');
+
+  const res = await fetch('/auth/password-recovery/complete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: recoveryToken, newPassword: next }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) return err(body.error || 'The password could not be changed');
+  recoveryToken = null;
+  $('rp').value = '';
+  $('rp2').value = '';
+  ok(body.message);
+  showCard('auth');
+});
+
 function logout() {
   api('/auth/logout', { method: 'POST' }).catch(() => {});
+  signedOut();
+}
+
+/** Back to the sign-in screen, whether the user asked or the server ended the session. */
+function signedOut() {
   sess.token = null;
   state.me = null;
   ownPanel = null;
   adminPanels.clear();
   $('app').hidden = true;
+  $('forgot').hidden = true;
+  $('recover').hidden = true;
   for (const v of ['access', 'services', 'platform']) $(`view-${v}`).hidden = true;
   $('views').hidden = true;
   $('sub').hidden = true;
@@ -384,7 +546,7 @@ function logout() {
 async function enter() {
   state.me = await api('/me');
   const mine = await api('/tenants/mine');
-  state.ownTenants = mine.tenants.filter((t) => t.isAdmin);
+  state.ownTenants = mine.tenants.filter(administers);
 
   $('auth').hidden = true;
   $('app').hidden = false;
@@ -491,9 +653,9 @@ $('catalog-roles').addEventListener('click', async (e) => {
   if (btn) await submitRequest({ role: btn.dataset.reqPlatform });
 });
 
-// Testing your own access replays your real session token rather than minting
-// an impersonation one, so a stale or revoked session shows the 401 you would
-// actually get instead of a freshly-signed success.
+// Testing your own access replays your real session token, so a stale or
+// revoked session shows the 401 you would actually get. (Testing someone
+// else's never involves a token at all — see assets/access-test.js.)
 $('test-mine').addEventListener('click', () => runAccessTest(api, {
   path: '/me/test-access',
   title: `Access test — ${state.me.username}`,
@@ -509,7 +671,7 @@ $('test-mine').addEventListener('click', () => runAccessTest(api, {
 
 async function refreshOwn() {
   const mine = await api('/tenants/mine');
-  state.ownTenants = mine.tenants.filter((t) => t.isAdmin);
+  state.ownTenants = mine.tenants.filter(administers);
 
   $('own-card').hidden = state.ownTenants.length === 0;
   if (!state.ownTenants.length) { $('reg').hidden = false; return; }
@@ -692,9 +854,15 @@ async function refreshUsers() {
       <tr>
         <td class="mono">${esc(u.username)}</td>
         <td>${badge(u.role === 'admin' ? 'info' : 'plain', u.role)}</td>
+        <td>${badge(u.status, u.status)}</td>
         <td>${chips(platform) || '<span class="muted">none</span>'}
           ${tenantCount ? `<span class="muted">+ ${tenantCount} tenant role(s)</span>` : ''}</td>
         <td class="nowrap">
+          ${u.status === 'suspended'
+            ? `<button class="ghost tiny" data-reactivate="${esc(u.username)}">Reactivate</button>`
+            : `<button class="ghost tiny" data-suspend="${esc(u.username)}">Suspend</button>`}
+          <button class="ghost tiny" data-end-sessions="${esc(u.username)}">End sessions</button>
+          <button class="ghost tiny" data-recovery="${esc(u.username)}">Recovery link</button>
           <button class="ghost tiny" data-reset="${esc(u.username)}">Reset password</button>
           <button class="danger tiny" data-del-user="${esc(u.username)}">Delete</button>
         </td>
@@ -708,8 +876,21 @@ $('users').addEventListener('click', async (e) => {
   if (btn.dataset.delUser) {
     if (!confirmDanger(`Delete account '${btn.dataset.delUser}'?\n\nThey are removed from every tenant. This cannot be undone.`)) return;
     ok((await api(`/admin/users/${encodeURIComponent(btn.dataset.delUser)}`, { method: 'DELETE' })).message);
+  } else if (btn.dataset.suspend) {
+    if (!confirmDanger(`Suspend account '${btn.dataset.suspend}'?\n\nIt is signed out everywhere and cannot sign in until reactivated. Its roles and memberships are kept.`)) return;
+    ok((await api(`/admin/users/${encodeURIComponent(btn.dataset.suspend)}/suspend`, { method: 'POST' })).message);
+  } else if (btn.dataset.reactivate) {
+    ok((await api(`/admin/users/${encodeURIComponent(btn.dataset.reactivate)}/reactivate`, { method: 'POST' })).message);
+  } else if (btn.dataset.endSessions) {
+    ok((await api(`/admin/users/${encodeURIComponent(btn.dataset.endSessions)}/revoke-sessions`, { method: 'POST' })).message);
+    return;
+  } else if (btn.dataset.recovery) {
+    const issued = await api(`/admin/users/${encodeURIComponent(btn.dataset.recovery)}/recovery-link`, { method: 'POST' });
+    // Shown once, here, to be handed to the account's owner out of band.
+    window.prompt(`${issued.message}\n\nCopy this link and give it to '${btn.dataset.recovery}':`, issued.link);
+    return;
   } else if (btn.dataset.reset) {
-    const pw = window.prompt(`New password for '${btn.dataset.reset}'? All their sessions will be invalidated.`);
+    const pw = window.prompt(`Temporary password for '${btn.dataset.reset}' (at least 8 characters)?\n\nThey will have to replace it at next sign-in. A recovery link avoids you knowing their password at all.`);
     if (!pw) return;
     ok((await api(`/admin/users/${encodeURIComponent(btn.dataset.reset)}/reset-password`,
       { method: 'POST', body: { newPassword: pw } })).message);
@@ -810,9 +991,26 @@ $('new-policy').addEventListener('submit', async (e) => {
 $('go').addEventListener('click', submitAuth);
 $('p').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAuth(); });
 $('u').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('p').focus(); });
+setMode('login');
 
-// A stored token is only a hint — the server decides whether it is still good.
-if (sess.token) enter().catch(() => { sess.token = null; });
+const arrival = new URLSearchParams(location.search);
+const fragment = new URLSearchParams(location.hash.slice(1));
+
+if (arrival.has('code') || arrival.has('error')) {
+  // Back from the gateway's sign-in page.
+  finishSignIn(arrival).catch((e) => err(e.message));
+} else if (fragment.has('recover')) {
+  // Arrived on a recovery link. Take the token out of the address bar at once.
+  recoveryToken = fragment.get('recover');
+  history.replaceState(null, '', location.pathname);
+  showCard('recover');
+} else if (location.hash === '#forgot') {
+  history.replaceState(null, '', location.pathname);
+  showCard('forgot');
+} else if (sess.token) {
+  // A stored token is only a hint — the server decides whether it is still good.
+  enter().catch(() => { sess.token = null; });
+}
 </script>
 
 </body>

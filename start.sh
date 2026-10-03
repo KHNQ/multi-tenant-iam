@@ -14,6 +14,14 @@
 #   ./start.sh status     show what is currently up
 #   ./start.sh logs       tail the combined structured log
 #
+# Three settings have no default and must be supplied — exported, or in a .env
+# file next to this script (see .env.example):
+#   JWT_SECRET                  the gateway's token signing key
+#   UPSTREAM_ALLOWED_CIDRS      the networks services may be registered in and
+#                               proxied to
+#   REGISTRY_ENROLLMENT_TOKEN   what the mock services present to register
+#                               themselves with the registry
+#
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +31,19 @@ REDIS_PORT="${REDIS_PORT:-7000}"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 cd "$ROOT" || exit 1
+
+# Local, untracked configuration. Anything already exported wins, so a real
+# deployment can inject its secrets however it normally does.
+if [[ -f "$ROOT/.env" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    key="${line%%=*}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue   # comments, blanks
+    [[ -n "${!key+x}" ]] || export "$key=${line#*=}"
+  done <"$ROOT/.env"
+fi
+
+INITIAL_ADMIN_PASSWORD_FILE="${INITIAL_ADMIN_PASSWORD_FILE:-$RUN_DIR/initial-admin-password}"
+export INITIAL_ADMIN_PASSWORD_FILE
 
 # name | script | port | readiness URL | marker that must appear in the response
 #
@@ -149,7 +170,56 @@ start_one() {
   return 1
 }
 
+# Three settings have no built-in value, on purpose — each default would be a
+# secret printed in this repository, or a rule that allows the one thing it is
+# there to prevent. Checked here, together, so the reason is the first thing
+# printed rather than something to dig out of a boot log after half the stack
+# has come up, and so a first run reports everything that is missing at once.
+require_configuration() {
+  local missing=0
+  problem() {
+    [[ $missing -eq 0 ]] && step "Configuration"
+    missing=1
+    fail "$1"
+    printf "        %s\n" "$2"
+  }
+
+  # The gateway refuses to boot without a signing key.
+  if [[ -z "${JWT_SECRET:-}" ]]; then
+    problem "JWT_SECRET is not set — the gateway has no default signing key and will not start without one" \
+      'echo "JWT_SECRET=$(openssl rand -base64 48)" >> .env'
+  elif [[ ${#JWT_SECRET} -lt 32 ]]; then
+    problem "JWT_SECRET is too short (${#JWT_SECRET} chars) — it must be at least 32" \
+      'echo "JWT_SECRET=$(openssl rand -base64 48)" >> .env'
+  fi
+
+  # Nothing is reachable through the gateway, and nothing can be registered,
+  # until somebody says which networks services live in. The convenient
+  # default (loopback) is exactly where Redis and the registry are.
+  if [[ -z "${UPSTREAM_ALLOWED_CIDRS:-}" ]]; then
+    problem "UPSTREAM_ALLOWED_CIDRS is not set — the registry and gateway would refuse every service destination" \
+      'echo "UPSTREAM_ALLOWED_CIDRS=127.0.0.0/8,::1/128" >> .env     # this local stack only'
+  fi
+
+  # The registry creates records only for callers it can authenticate. The
+  # mock services in this stack register themselves, so they need the
+  # enrollment token — and so does the registry, to recognise it.
+  if [[ -z "${REGISTRY_ENROLLMENT_TOKEN:-}" ]]; then
+    problem "REGISTRY_ENROLLMENT_TOKEN is not set — the mock services could not register themselves" \
+      'echo "REGISTRY_ENROLLMENT_TOKEN=$(openssl rand -hex 32)" >> .env'
+  elif [[ ${#REGISTRY_ENROLLMENT_TOKEN} -lt 32 ]]; then
+    problem "REGISTRY_ENROLLMENT_TOKEN is too short (${#REGISTRY_ENROLLMENT_TOKEN} chars) — it must be at least 32" \
+      'echo "REGISTRY_ENROLLMENT_TOKEN=$(openssl rand -hex 32)" >> .env'
+  fi
+
+  if [[ $missing -ne 0 ]]; then
+    printf "\n      %sthese go in .env (untracked) or the environment — see .env.example%s\n" "$DIM" "$RESET"
+    return 1
+  fi
+}
+
 start_all() {
+  require_configuration || exit 1
   ensure_redis || exit 1
 
   step "Services"
@@ -166,10 +236,18 @@ start_all() {
   ${CYAN}Console${RESET}         http://localhost:3000/    ${DIM}(one sign-in; panels follow your account)${RESET}
   ${CYAN}API docs${RESET}        http://localhost:3000/docs
   ${CYAN}Registry${RESET}        http://localhost:3001/services
-  ${CYAN}Seed admin${RESET}      admin / adminpass
+EOF
+  # Present only until the initial admin has replaced their one-time password.
+  if [[ -f "$INITIAL_ADMIN_PASSWORD_FILE" ]]; then
+    printf "  %sFirst login%s     user 'admin', one-time password in %s\n" \
+      "$CYAN" "$RESET" "${INITIAL_ADMIN_PASSWORD_FILE#"$ROOT"/}"
+    printf "                  %s(must be changed at first login; the file is removed once it has been)%s\n" \
+      "$DIM" "$RESET"
+  fi
+  cat <<EOF
 
-  ${DIM}run tests:${RESET}      npm run e2e
-  ${DIM}check routes:${RESET}   npm run check:endpoints
+  ${DIM}run tests:${RESET}      ADMIN_PASSWORD=<admin password> npm run e2e   ${DIM}(or put ADMIN_PASSWORD in .env)${RESET}
+  ${DIM}check routes:${RESET}   ADMIN_PASSWORD=<admin password> npm run check:endpoints
   ${DIM}tail logs:${RESET}      ./start.sh logs
   ${DIM}shut down:${RESET}      ./start.sh stop
 EOF

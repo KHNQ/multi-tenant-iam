@@ -15,15 +15,21 @@
  * markup and its script, and every field path the UI depends on is asserted
  * against a live response from the running gateway.
  *
- * Run: node src/ui-check.js      (stack must be up)
+ * Run: ADMIN_PASSWORD=<platform admin password> node src/ui-check.js      (stack must be up)
  */
 
+require('./local-env'); // .env, when run by hand
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 
 const GATEWAY = process.env.GATEWAY_URL || 'http://localhost:3000';
-const ADMIN = { username: 'admin', password: process.env.ADMIN_PASSWORD || 'adminpass' };
+const ADMIN = { username: process.env.ADMIN_USERNAME || 'admin', password: process.env.ADMIN_PASSWORD };
+
+if (!ADMIN.password) {
+  console.error('ADMIN_PASSWORD is not set. Run as:  ADMIN_PASSWORD=<platform admin password> npm run check:ui   (or put it in .env)');
+  process.exit(1);
+}
 
 const C = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
@@ -291,7 +297,7 @@ async function auditShapes() {
       'services[].tenant.displayName', 'services[].tenant.roles', 'services[].tenant.joined']],
     ['GET', '/catalog/roles', ['roles']],
     ['GET', '/requests/me', ['requests']],
-    ['GET', '/admin/users', ['users[].username', 'users[].role', 'users[].roles']],
+    ['GET', '/admin/users', ['users[].username', 'users[].role', 'users[].status', 'users[].roles']],
     ['GET', '/admin/roles', ['roles[].role', 'roles[].users']],
     ['GET', '/admin/policies', ['policies[].subject', 'policies[].resource', 'policies[].action']],
     ['GET', '/admin/requests', ['requests']],
@@ -317,31 +323,42 @@ async function auditShapes() {
   }
 
   // The access-test inspector renders far more than a status code, so its
-  // shape is checked field by field — a missing `request` or `response` here
-  // renders a blank panel with nothing in the console to explain it.
-  const probeFields = [
-    'username', 'testedAt',
-    'token.value', 'token.masked', 'token.header', 'token.claims', 'token.note',
+  // shape is checked field by field — a missing field here renders a blank
+  // panel with nothing in the console to explain it. There are two shapes,
+  // because there are two kinds of test (see assets/access-test.js).
+  const sharedFields = [
+    'username', 'testedAt', 'mode',
     'services[].service', 'services[].allowedCount', 'services[].totalCount',
-    'services[].endpoints[].endpoint', 'services[].endpoints[].status',
-    'services[].endpoints[].decision', 'services[].endpoints[].latencyMs',
+    'services[].endpoints[].endpoint', 'services[].endpoints[].decision',
+  ];
+  // Testing yourself: a real call with your own token, so the whole exchange.
+  const liveCallFields = [
+    ...sharedFields,
+    'token.value', 'token.header', 'token.claims', 'token.note',
+    'services[].endpoints[].status', 'services[].endpoints[].latencyMs',
     'services[].endpoints[].request.method', 'services[].endpoints[].request.url',
     'services[].endpoints[].request.headers',
     'services[].endpoints[].response?.status', 'services[].endpoints[].response?.headers',
   ];
+  // Testing someone else: the gateway's decision only — nothing was sent.
+  const evaluationFields = [...sharedFields, 'note'];
 
-  for (const [label, path_, extra] of [
-    ['POST /tenants/:id/users/:u/test-access', `/tenants/${id}/users/${user}/test-access`, ['tenant', 'roles']],
-    ['POST /admin/users/:u/test-access', `/admin/users/${user}/test-access`, ['roles']],
-    ['POST /me/test-access', '/me/test-access', ['roles', 'tenants']],
+  for (const [label, path_, fields, mode] of [
+    ['POST /tenants/:id/users/:u/test-access', `/tenants/${id}/users/${user}/test-access`,
+      [...evaluationFields, 'tenant', 'roles'], 'policy-evaluation'],
+    ['POST /admin/users/:u/test-access', `/admin/users/${user}/test-access`,
+      [...evaluationFields, 'roles'], 'policy-evaluation'],
+    ['POST /me/test-access', '/me/test-access', [...liveCallFields, 'roles', 'tenants'], 'live-call'],
   ]) {
     const res = await request('POST', `${GATEWAY}${path_}`, { token });
     if (res.status !== 200) { check(label, false, `HTTP ${res.status}`); continue; }
-    const bad = [...probeFields, ...extra]
+    const bad = fields
       .map((f) => ({ f, r: readPath(res.body, f) }))
       .filter((x) => !x.r.ok);
     check(`${label} returns everything the inspector renders`,
       bad.length === 0, bad.map((x) => `${x.f} (${x.r.reason})`).join(', '));
+    check(`${label} declares mode '${mode}', which picks the inspector's renderer`,
+      res.body.mode === mode, `mode=${res.body.mode}`);
   }
 
   await request('DELETE', `${GATEWAY}/admin/tenants/${id}?deregister=true`, { token });
@@ -400,18 +417,19 @@ async function auditRenderHelpers() {
     'the handler still collapses subject and value into one variable');
 }
 
-// ─── 5b. LIVE: an access test must not hand out a usable credential ──────────
+// ─── 5b. LIVE: an access test must not create a credential for someone else ──
 
 /**
- * The inspector shows the bearer token, which is the point — you cannot debug
- * a denial without seeing what the gateway read. But an admin testing someone
- * else must not walk away with a working token for them: that would turn
- * "test access" into "impersonate any member, in any tenant they belong to,
- * for as long as the token lives". So the claims are shown in full and the
- * raw value is cut. This proves the cut value is genuinely inert.
+ * Testing another account's access used to mint a short-lived token for them
+ * and replay it through the proxy. The copy in the response was masked, but
+ * the real one still went to every upstream service on the way — including a
+ * service operated by the very tenant admin running the test — and it was
+ * good for everything that account could do anywhere. So an admin-run test
+ * now involves no token at all, and this proves it: nothing token-shaped comes
+ * back, and nothing the report does contain authenticates.
  */
 async function auditTokenExposure() {
-  console.log(`\n${C.bold}${C.cyan}── Access test does not leak a usable token ───────────────${C.reset}`);
+  console.log(`\n${C.bold}${C.cyan}── Access test does not create a token for anyone else ────${C.reset}`);
 
   const admin = (await request('POST', `${GATEWAY}/auth/login`, { body: ADMIN })).body.token;
   const rand = Math.floor(Math.random() * 100000);
@@ -420,44 +438,33 @@ async function auditTokenExposure() {
   await request('POST', `${GATEWAY}/admin/roles`, { token: admin, body: { username: victim, role: 'green_role' } });
 
   const probe = await request('POST', `${GATEWAY}/admin/users/${victim}/test-access`, { token: admin });
-  const shown = probe.body?.token;
+  const report = JSON.stringify(probe.body ?? {});
 
-  check('an admin testing someone else gets a MASKED token',
-    shown?.masked === true, `masked=${shown?.masked}`);
+  check('an admin testing someone else gets no token field at all',
+    probe.status === 200 && !('token' in (probe.body || {})),
+    `status=${probe.status}, token=${JSON.stringify(probe.body?.token)}`);
 
-  const maskedIsInert = await (async () => {
-    try {
-      const res = await request('GET', `${GATEWAY}/me`, { token: shown.value });
-      return { inert: res.status === 401 || res.status === 403, how: `rejected with ${res.status}` };
-    } catch (e) {
-      // The ellipsis in a masked token is not even a legal HTTP header
-      // character, so it cannot be put on the wire at all — a stronger
-      // result than being rejected on arrival.
-      return { inert: /Invalid character in header/.test(e.message), how: 'not transmittable as a header' };
-    }
-  })();
+  check('nothing shaped like a JWT appears anywhere in the report',
+    !/eyJ[\w-]+\.[\w-]+\.[\w-]+/.test(report),
+    'the report contains a JWT');
 
-  check(`the masked value is not a usable credential (${maskedIsInert.how})`,
-    maskedIsInert.inert,
-    'the masked token was accepted by /me — it is a real credential, not a preview');
+  check('no request or response was recorded, because none was made',
+    (probe.body?.services || []).every((s) => s.endpoints.every((e) => !('request' in e) && !('response' in e))),
+    'an endpoint result carries a request/response — something was sent on the user\'s behalf');
 
-  check('the claims are still shown in full, so a denial can be debugged',
-    shown?.claims?.username === victim && typeof shown.claims.jti === 'string'
-      && typeof shown.claims.exp === 'number',
-    `claims=${JSON.stringify(shown?.claims)}`);
-
-  check('the minted impersonation token is short-lived',
-    shown?.expiresInSeconds !== null && shown.expiresInSeconds <= 120,
-    `expiresInSeconds=${shown?.expiresInSeconds} — an access test should not mint a day-long credential`);
+  check('the report still explains each decision, so a denial can be debugged',
+    (probe.body?.services || []).flatMap((s) => s.endpoints).every((e) =>
+      (e.decision === 'allowed' ? Boolean(e.grantedBy) : typeof e.explanation === 'string')),
+    'an endpoint result has neither grantedBy nor an explanation');
 
   // Testing yourself is different: it is your own session token, already in
-  // your browser, so hiding it would be theatre.
+  // your browser, and replaying it is just making the call you would make.
   const victimToken = (await request('POST', `${GATEWAY}/auth/login`,
     { body: { username: victim, password: 'uicheckpass1' } })).body.token;
   const selfProbe = await request('POST', `${GATEWAY}/me/test-access`, { token: victimToken });
-  check('testing your own access reveals your own token in full',
-    selfProbe.body?.token?.masked === false && selfProbe.body.token.value === victimToken,
-    'self-test masked the caller\'s own token, or returned a different one');
+  check('testing your own access shows your own token — the one you sent, not a new one',
+    selfProbe.body?.token?.value === victimToken,
+    'self-test returned a token other than the caller\'s own');
 
   check('a self-test reports the caller, not whoever they asked about',
     selfProbe.body?.username === victim, `got ${selfProbe.body?.username}`);

@@ -309,6 +309,10 @@ button:disabled { opacity: .45; cursor: not-allowed; transform: none; filter: no
 }
 .auth h2 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
 .auth input { width: 100%; }
+/* The sign-in pages the gateway renders itself (oidc.js) are sent with a CSP
+   that allows no inline style, so their layout has to come from here. */
+.auth form { display: flex; flex-direction: column; gap: 11px; }
+.auth p { margin: 0; }
 .tabs { display: flex; gap: 6px; padding: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); }
 .tabs button {
   flex: 1; background: transparent; color: var(--muted);

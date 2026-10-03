@@ -25,6 +25,7 @@
  * Prerequisite: node src/loadtest/seed.js has already run.
  */
 
+require('../local-env'); // .env, when run by hand
 const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
@@ -106,7 +107,7 @@ if (pool.length < CONFIG.concurrency) {
 
 // authoritative in-memory mirror, mutated by chaos, read by the correctness check
 const userState = new Map();
-for (const u of pool) userState.set(u.username, { token: u.token, roles: new Set(u.roles) });
+for (const u of pool) userState.set(u.username, { token: u.token, password: u.password, roles: new Set(u.roles) });
 
 const policyOff = new Set(); // `${tier}|${resource}` currently removed by policy chaos
 // Keyed by `${username}|${tier}`, NOT just username — a user touched by two
@@ -144,13 +145,18 @@ const mutationLog = []; // { t, username, role, method } — every successful ro
 
 let mismatchCount = 0;
 let requestCount = 0;
+let reauthCount = 0;
 
 // ─── ADMIN AUTH ───────────────────────────────────────────────────────────
 
 let adminToken = null;
 async function adminLogin() {
+  if (!process.env.ADMIN_PASSWORD) {
+    throw new Error('ADMIN_PASSWORD is not set — the gateway has no default admin password to fall back on');
+  }
   const res = await timedRequest('POST', `${CONFIG.gateway}/auth/login`, {
-    body: { username: 'admin', password: 'adminpass' }, agent: adminAgent,
+    body: { username: process.env.ADMIN_USERNAME || 'admin', password: process.env.ADMIN_PASSWORD },
+    agent: adminAgent,
   });
   if (res.status !== 200) throw new Error(`Admin login failed: ${res.status}`);
   return res.body.token;
@@ -159,6 +165,21 @@ async function adminLogin() {
 // ─── VIRTUAL USERS ────────────────────────────────────────────────────────
 
 let stopFlag = false;
+
+// Revoking a role ends the account's sessions: the gateway moves its security
+// version, and every token issued before that is refused with a 401. So a
+// virtual user whose role the chaos loop just removed has to sign in again
+// before its next request means anything — which is what a real client does.
+async function signInAgain(username) {
+  const u = userState.get(username);
+  const res = await timedRequest('POST', `${CONFIG.gateway}/auth/login`, {
+    body: { username, password: u.password }, agent, timeoutMs: CONFIG.requestTimeoutMs,
+  });
+  if (res.status !== 200) return false;
+  u.token = res.body.token;
+  reauthCount++;
+  return true;
+}
 
 async function virtualUserLoop(username) {
   while (!stopFlag) {
@@ -169,7 +190,15 @@ async function virtualUserLoop(username) {
     const t0 = Date.now();
 
     const u = userState.get(username);
-    const res = await timedRequest('GET', url, { token: u.token, agent, timeoutMs: CONFIG.requestTimeoutMs });
+    let res = await timedRequest('GET', url, { token: u.token, agent, timeoutMs: CONFIG.requestTimeoutMs });
+    // A 401 is "your session ended", not an authorization answer: sign in
+    // again and ask the question that was actually being asked. More than
+    // once if need be — ANY revoke for this user ends the session, including
+    // one for a tier this request has nothing to do with, and chaos can land
+    // another while the new sign-in is in flight.
+    for (let retry = 0; res.status === 401 && retry < 3 && (await signInAgain(username)); retry++) {
+      res = await timedRequest('GET', url, { token: u.token, agent, timeoutMs: CONFIG.requestTimeoutMs });
+    }
     requestCount++;
 
     const actual = res.status === 200;
@@ -250,13 +279,21 @@ async function roleChaosTickBody() {
         const stillGranted = [...u.roles].some((r) => (tierServices[r] || []).includes(svc));
         if (!stillGranted) {
           const probeT0 = Date.now();
+          // Two things have to hold. The token held at the moment of the
+          // revoke is refused outright (401 — or already replaced, if the
+          // user's own loop got there first and signed in again)...
+          const stale = await timedRequest('GET', `${CONFIG.gateway}/gateway/${svc}/ping`, {
+            token: u.token, agent: adminAgent, timeoutMs: CONFIG.requestTimeoutMs,
+          });
+          if (stale.status === 401) await signInAgain(username);
+          // ...and signed in afresh, the resource is denied on its merits.
           const probeRes = await timedRequest('GET', `${CONFIG.gateway}/gateway/${svc}/ping`, {
             token: u.token, agent: adminAgent, timeoutMs: CONFIG.requestTimeoutMs,
           });
           revocationChecks.push({
             t: probeT0, username, role, resource,
-            latencyMs: probeRes.durationMs, status: probeRes.status,
-            correct: probeRes.status === 403,
+            latencyMs: stale.durationMs, status: probeRes.status, staleTokenStatus: stale.status,
+            correct: [401, 403].includes(stale.status) && probeRes.status === 403,
           });
         }
       }
@@ -465,6 +502,7 @@ async function main() {
     totals: {
       requests: requestCount,
       mismatches: mismatchCount,
+      reauthentications: reauthCount,
       mismatchRate: requestCount ? mismatchCount / requestCount : 0,
       chaosMutations: adminSamples.length,
       chaosMutationsOk: adminSamples.filter((a) => a.status === 200).length,
