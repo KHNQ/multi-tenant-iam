@@ -154,7 +154,7 @@ const v = {
   action: oneOf(HTTP_ACTIONS, { lowercase: true }),
 
   requestId: string({ max: 64, pattern: /^[0-9a-fA-F-]{8,64}$/, patternMessage: 'is not a valid request id' }),
-  requestStatus: oneOf(['pending', 'approved', 'rejected']),
+  requestStatus: oneOf(['pending', 'approved', 'rejected', 'cancelled']),
 
   /** An attribute condition on a policy (abac.js). Bounded: it is evaluated on the request path. */
   condition: (raw) => {

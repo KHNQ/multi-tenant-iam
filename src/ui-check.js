@@ -462,9 +462,15 @@ async function auditTokenExposure() {
   const victimToken = (await request('POST', `${GATEWAY}/auth/login`,
     { body: { username: victim, password: 'uicheckpass1' } })).body.token;
   const selfProbe = await request('POST', `${GATEWAY}/me/test-access`, { token: victimToken });
-  check('testing your own access shows your own token — the one you sent, not a new one',
-    selfProbe.body?.token?.value === victimToken,
-    'self-test returned a token other than the caller\'s own');
+  // Identified by its id (jti), and shown shortened: the report never repeats
+  // a usable token, not even the caller's own.
+  const sentJti = JSON.parse(Buffer.from(victimToken.split('.')[1], 'base64url').toString()).jti;
+  check('testing your own access describes your own token — the one you sent, not a new one',
+    selfProbe.body?.token?.claims?.jti === sentJti,
+    'self-test described a token other than the caller\'s own');
+  check('the self-test report does not repeat the token in full',
+    selfProbe.body?.token?.masked === true && !JSON.stringify(selfProbe.body).includes(victimToken),
+    'the full token appears in the report');
 
   check('a self-test reports the caller, not whoever they asked about',
     selfProbe.body?.username === victim, `got ${selfProbe.body?.username}`);

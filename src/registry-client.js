@@ -57,6 +57,8 @@ const sameList = (a = [], b = []) => a.length === b.length && [...a].sort().join
 function createRegistryClient({ registryUrl, log }) {
   async function call(method, route, { token, enroll, body } = {}) {
     const response = await fetch(`${registryUrl}${route}`, {
+      // Carries the service token: a redirect is an error, not a hop.
+      redirect: 'error',
       method,
       headers: {
         'Content-Type': 'application/json',

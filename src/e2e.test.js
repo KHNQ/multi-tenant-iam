@@ -3687,6 +3687,643 @@ async function runOperationsTests() {
   }
 }
 
+// ── 19. REVIEW FIXES — regression tests for the second security review ───────
+//
+// One suite per finding. Several need a gateway started with a particular
+// configuration (a trusted proxy, an unwritable password file, a fresh Redis),
+// so they start their own, next to the one under test, and stop it after.
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function redisClient(url = process.env.REDIS_URL || 'redis://localhost:7000') {
+  const Redis = require('ioredis');
+  const client = new Redis(url, { maxRetriesPerRequest: 2 });
+  client.on('error', () => {});
+  return client;
+}
+
+/** A local HTTP server on a free port; `handler` gets every request. */
+function listen(handler) {
+  return new Promise((resolve) => {
+    const server = http.createServer(handler);
+    server.listen(0, () => resolve({ server, port: server.address().port, close: () => new Promise((r) => server.close(r)) }));
+  });
+}
+
+/** Starts another gateway process with `env` on top of this one's environment. */
+function startGateway(env = {}) {
+  const port = 3800 + Math.floor(Math.random() * 180);
+  const child = spawn(process.execPath, [path.join(__dirname, 'main.reg.js')], {
+    env: { ...process.env, PORT: String(port), ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  const exited = new Promise((resolve) => child.on('exit', (code) => resolve(code)));
+  return {
+    url: `http://localhost:${port}`,
+    exited,
+    output: () => output,
+    ready: () => waitFor(`http://localhost:${port}/docs.json`, `gateway on ${port}`, 25000),
+    stop: async () => { child.kill('SIGTERM'); await Promise.race([exited, pause(5000)]); },
+  };
+}
+
+/** A throwaway redis-server, for what only happens on an empty deployment. */
+async function startScratchRedis() {
+  const fs = require('fs');
+  const os = require('os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'iam-e2e-redis-'));
+  const port = 7400 + Math.floor(Math.random() * 300);
+  const child = spawn('redis-server', ['--port', String(port), '--bind', '127.0.0.1', '--save', '', '--appendonly', 'no', '--dir', dir], { stdio: 'ignore' });
+  const failed = new Promise((resolve) => { child.on('error', () => resolve(true)); child.on('exit', () => resolve(true)); });
+  const url = `redis://127.0.0.1:${port}`;
+  const client = redisClient(url);
+  for (let i = 0; i < 50; i++) {
+    if (await Promise.race([failed, pause(100).then(() => false)])) break;
+    try { if (await client.ping() === 'PONG') return { url, dir, client, stop: async () => { client.disconnect(); child.kill('SIGTERM'); await pause(300); fs.rmSync(dir, { recursive: true, force: true }); } }; } catch { /* starting */ }
+  }
+  client.disconnect();
+  child.kill('SIGTERM');
+  fs.rmSync(dir, { recursive: true, force: true });
+  return null;
+}
+
+// 19a ─────────────────────────────────────────────────────────────────────────
+async function runSelfProbeRedirectTests() {
+  suite('Review fixes — the access self-test never follows a redirect');
+
+  const id = `redir${randomUUID().replace(/-/g, '').slice(0, 10)}`;
+  const owner = uniqueUser('redir_owner');
+  const password = 'Redirect-Owner-1!';
+  const caught = [];
+  const capture = await listen((req, res) => { caught.push({ url: req.url, authorization: req.headers.authorization || null }); res.end('{}'); });
+  const trap = `http://localhost:${capture.port}/stolen`;
+  // A service that answers everything with "go over there".
+  const service = await listen((req, res) => { res.writeHead(302, { Location: trap }); res.end(); });
+
+  try {
+    await test('A service that redirects is registered as a tenant', async () => {
+      const token = await createUserAndLogin(owner, password);
+      const res = await request('POST', `${CONFIG.gateway}/tenants/register`, {
+        token, body: { name: id, baseUrl: `http://localhost:${service.port}`, endpoints: [`/${id}/go`] },
+      });
+      assertEqual(res.status, 201, `register (${JSON.stringify(res.body)})`);
+    });
+
+    await test("An admin's self-test reaches it and reports the redirect — without following it", async () => {
+      const res = await request('POST', `${CONFIG.gateway}/me/test-access`, { token: state.adminToken, timeout: 30000 });
+      assertEqual(res.status, 200, 'test-access status');
+      const endpoint = res.body.services.find((s) => s.service === id)?.endpoints.find((e) => e.endpoint === `/${id}/go`);
+      assert(endpoint, 'the redirecting endpoint is not in the report');
+      assertEqual(endpoint.status, 302, 'reported status');
+      assertEqual(endpoint.redirect?.location, trap, 'reported Location');
+      assertEqual(endpoint.redirect?.followed, false, 'followed');
+      await pause(300);
+      assertEqual(caught.length, 0, `requests that reached the redirect target (${JSON.stringify(caught)})`);
+    });
+
+    await test('The report does not repeat the caller\'s token', async () => {
+      const res = await request('POST', `${CONFIG.gateway}/me/test-access`, { token: state.adminToken, timeout: 30000 });
+      assert(!JSON.stringify(res.body).includes(state.adminToken), 'the admin token appears in the report');
+      assertEqual(caught.length, 0, 'requests that reached the redirect target');
+    });
+  } finally {
+    await request('DELETE', `${CONFIG.gateway}/admin/tenants/${id}?deregister=true`, { token: state.adminToken });
+    await request('DELETE', `${CONFIG.gateway}/admin/users/${owner}`, { token: state.adminToken });
+    await capture.close();
+    await service.close();
+  }
+}
+
+// 19b ─────────────────────────────────────────────────────────────────────────
+async function runRegistryRaceTests() {
+  suite('Review fixes — registry names are reserved, and writes are conditional');
+
+  const enroll = { 'X-Enrollment-Token': CONFIG.enrollmentToken };
+  const owned = new Map(); // name -> token, for cleanup
+  let catalogDelay = 0;
+  const catalog = await listen(async (req, res) => {
+    if (catalogDelay) await pause(catalogDelay);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ version: 'v-catalog', endpoints: [] }));
+  });
+  const catalogUrl = `http://localhost:${catalog.port}/catalog`;
+  const fresh = () => `race${randomUUID().replace(/-/g, '').slice(0, 10)}`;
+  const register = (body, headers = enroll) => request('POST', `${CONFIG.registry}/register`, { body, headers, timeout: 15000 });
+  const withToken = (token) => ({ 'X-Service-Token': token });
+
+  try {
+    await test('Of eight simultaneous registrations of one new name, exactly one succeeds', async () => {
+      const name = fresh();
+      catalogDelay = 600; // keeps every attempt in flight at once
+      const attempts = await Promise.all(Array.from({ length: 8 }, (_, i) => register({
+        name, baseUrl: `http://localhost:${9200 + i}`, catalogUrl,
+      })));
+      catalogDelay = 0;
+      const winners = attempts.filter((r) => r.status === 201);
+      assertEqual(winners.length, 1, `201s (${attempts.map((r) => r.status).join(',')})`);
+      assertEqual(attempts.filter((r) => r.status === 409).length, 7, '409s');
+      owned.set(name, winners[0].body.serviceToken);
+
+      const stored = await request('GET', `${CONFIG.registry}/services/${name}`);
+      assertEqual(stored.body.baseUrl, winners[0].body.service.baseUrl, 'the stored destination is the winner\'s');
+      const renew = await request('POST', `${CONFIG.registry}/services/${name}/heartbeat`, { headers: withToken(winners[0].body.serviceToken) });
+      assertEqual(renew.status, 200, 'the winner\'s token owns the name');
+    });
+
+    await test('A slow re-registration cannot overwrite a record that was replaced while it ran', async () => {
+      const name = fresh();
+      const first = await register({ name, baseUrl: 'http://localhost:9301' });
+      assertEqual(first.status, 201, 'first registration');
+      const oldToken = first.body.serviceToken;
+
+      catalogDelay = 1500;
+      const stale = register({ name, baseUrl: 'http://localhost:9302', catalogUrl }, withToken(oldToken));
+      await pause(300);
+      // Meanwhile: the owner deregisters, and somebody else registers the name.
+      assertEqual((await request('DELETE', `${CONFIG.registry}/services/${name}`, { headers: withToken(oldToken) })).status, 200, 'deregister');
+      const second = await register({ name, baseUrl: 'http://localhost:9303' });
+      assertEqual(second.status, 201, 'the new registration');
+      owned.set(name, second.body.serviceToken);
+
+      const late = await stale;
+      catalogDelay = 0;
+      assertEqual(late.status, 409, `the stale re-registration (${JSON.stringify(late.body).slice(0, 120)})`);
+      const stored = await request('GET', `${CONFIG.registry}/services/${name}`);
+      assertEqual(stored.body.baseUrl, 'http://localhost:9303', 'destination after the race');
+      assertEqual((await request('POST', `${CONFIG.registry}/services/${name}/heartbeat`, { headers: withToken(second.body.serviceToken) })).status, 200, 'the new owner\'s token');
+      assertEqual((await request('POST', `${CONFIG.registry}/services/${name}/heartbeat`, { headers: withToken(oldToken) })).status, 403, 'the old owner\'s token');
+    });
+
+    await test('A slow edit is refused if the record changed while it was being prepared', async () => {
+      const name = fresh();
+      const made = await register({ name, baseUrl: 'http://localhost:9304' });
+      const token = made.body.serviceToken;
+      owned.set(name, token);
+
+      catalogDelay = 1500;
+      const slow = request('PATCH', `${CONFIG.registry}/services/${name}`, {
+        headers: withToken(token), body: { catalogUrl, syncFromCatalog: true }, timeout: 15000,
+      });
+      await pause(300);
+      const quick = await request('PATCH', `${CONFIG.registry}/services/${name}`, { headers: withToken(token), body: { description: 'changed meanwhile' } });
+      assertEqual(quick.status, 200, 'the quick edit');
+      const late = await slow;
+      catalogDelay = 0;
+      assertEqual(late.status, 409, 'the slow edit');
+      const stored = await request('GET', `${CONFIG.registry}/services/${name}`);
+      assertEqual(stored.body.description, 'changed meanwhile', 'description');
+      assertEqual(stored.body.catalogUrl || '', '', 'catalogUrl (the stale edit was not written)');
+    });
+
+    await test('A failed registration gives the name back at once', async () => {
+      const name = fresh();
+      const refused = await register({ name, baseUrl: 'http://192.0.2.1:80' });
+      assertEqual(refused.status, 400, 'registration at a destination outside the allowlist');
+      const retry = await register({ name, baseUrl: 'http://localhost:9305' });
+      assertEqual(retry.status, 201, 'registering the same name straight after');
+      owned.set(name, retry.body.serviceToken);
+    });
+
+    await test('Two users registering one new service through the gateway: one owner, never two', async () => {
+      const name = fresh();
+      const users = [uniqueUser('race_a'), uniqueUser('race_b')];
+      const tokens = await Promise.all(users.map((u) => createUserAndLogin(u, 'Race-User-Pass-1!')));
+      const results = await Promise.all(tokens.map((token, i) => request('POST', `${CONFIG.gateway}/tenants/register`, {
+        token, body: { name, baseUrl: `http://localhost:${9310 + i}` },
+      })));
+      const statuses = results.map((r) => r.status).sort().join(',');
+      assertEqual(statuses, '201,409', 'statuses');
+      const winner = users[results.findIndex((r) => r.status === 201)];
+      const tenant = await request('GET', `${CONFIG.gateway}/tenants/${name}`, { token: state.adminToken });
+      assertEqual(tenant.body.owner, winner, 'tenant owner');
+      assertEqual(tenant.body.service?.baseUrl, results.find((r) => r.status === 201).body.service.baseUrl, 'routed destination');
+      await request('DELETE', `${CONFIG.gateway}/admin/tenants/${name}?deregister=true`, { token: state.adminToken });
+      for (const u of users) await request('DELETE', `${CONFIG.gateway}/admin/users/${u}`, { token: state.adminToken });
+    });
+  } finally {
+    catalogDelay = 0;
+    for (const [name, token] of owned) await request('DELETE', `${CONFIG.registry}/services/${name}`, { headers: withToken(token) });
+    await catalog.close();
+  }
+}
+
+// 19c ─────────────────────────────────────────────────────────────────────────
+async function runOidcBindingTests() {
+  suite('Review fixes — an OIDC grant does not outlive the account state or the client');
+
+  const password = 'Oidc-Binding-1!';
+  const redirectUri = 'https://binding.example.test/cb';
+  const b64url = (buffer) => Buffer.from(buffer).toString('base64url');
+  const form = (fields) => ({ method: 'POST', redirect: 'manual', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields) });
+  const created = [];
+  let client;
+
+  /** Sign in on the page; returns the code and its verifier, or the page response. */
+  async function signIn(username, pass, clientId = client.clientId, uri = redirectUri) {
+    const verifier = b64url(randomBytes(48));
+    const params = new URLSearchParams({
+      response_type: 'code', client_id: clientId, redirect_uri: uri, scope: 'openid profile', state: 's', nonce: 'n',
+      code_challenge: b64url(createHash('sha256').update(verifier).digest()), code_challenge_method: 'S256',
+    });
+    const page = await (await fetch(`${CONFIG.gateway}/oauth/authorize?${params}`)).text();
+    const blob = page.match(/name="request" value="([^"]+)"/)[1];
+    const res = await fetch(`${CONFIG.gateway}/oauth/authorize`, form({ request: blob, step: 'login', username, password: pass }));
+    const location = res.headers.get('location');
+    return { res, blob, verifier, code: location ? new URL(location).searchParams.get('code') : null };
+  }
+  const exchange = (code, verifier, clientId = client.clientId, uri = redirectUri) => fetch(`${CONFIG.gateway}/oauth/token`, form({
+    grant_type: 'authorization_code', code, redirect_uri: uri, client_id: clientId, code_verifier: verifier,
+  }));
+  async function account(prefix) {
+    const username = uniqueUser(prefix);
+    await createUserAndLogin(username, password);
+    created.push(username);
+    return username;
+  }
+
+  try {
+    await test('A test application is registered', async () => {
+      const res = await request('POST', `${CONFIG.gateway}/admin/oidc/clients`, { token: state.adminToken, body: { name: 'Binding test', redirectUris: [redirectUri] } });
+      assertEqual(res.status, 201, 'register client');
+      client = res.body.client;
+    });
+
+    await test('Control: a code exchanged straight away works', async () => {
+      const u = await account('bind_ok');
+      const { code, verifier } = await signIn(u, password);
+      assertEqual((await exchange(code, verifier)).status, 200, 'exchange');
+    });
+
+    const voidedBy = {
+      'ending every session of the account': (u) => request('POST', `${CONFIG.gateway}/admin/users/${u}/revoke-sessions`, { token: state.adminToken }),
+      'a password change': async (u) => request('POST', `${CONFIG.gateway}/auth/change-password`, {
+        token: await login(u, password), body: { currentPassword: password, newPassword: `${password}x` },
+      }),
+      'suspending and reactivating the account': async (u) => {
+        await request('POST', `${CONFIG.gateway}/admin/users/${u}/suspend`, { token: state.adminToken });
+        return request('POST', `${CONFIG.gateway}/admin/users/${u}/reactivate`, { token: state.adminToken });
+      },
+      'deleting the account and signing the name up again': async (u) => {
+        await request('DELETE', `${CONFIG.gateway}/admin/users/${u}`, { token: state.adminToken });
+        return request('POST', `${CONFIG.gateway}/auth/signup`, { body: { username: u, password } });
+      },
+    };
+    for (const [what, act] of Object.entries(voidedBy)) {
+      await test(`A code is void after ${what} between sign-in and exchange`, async () => {
+        const u = await account('bind');
+        const { code, verifier } = await signIn(u, password);
+        assert(code, 'no code was issued');
+        const done = await act(u);
+        assert(done.status < 300, `the change itself (${done.status})`);
+        const res = await exchange(code, verifier);
+        assertEqual(res.status, 400, 'exchange status');
+        assertEqual((await res.json()).error, 'invalid_grant', 'error');
+      });
+    }
+
+    await test('A code is void once its application is deleted', async () => {
+      const u = await account('bind_client');
+      const doomed = (await request('POST', `${CONFIG.gateway}/admin/oidc/clients`, { token: state.adminToken, body: { name: 'Doomed', redirectUris: [redirectUri] } })).body.client;
+      const { code, verifier } = await signIn(u, password, doomed.clientId);
+      await request('DELETE', `${CONFIG.gateway}/admin/oidc/clients/${doomed.clientId}`, { token: state.adminToken });
+      const res = await exchange(code, verifier, doomed.clientId);
+      assertEqual(res.status, 400, 'exchange after the client was deleted');
+    });
+
+    await test('Deleting an application ends the sessions it was issued — and only those', async () => {
+      const u = await account('bind_sessions');
+      const doomed = (await request('POST', `${CONFIG.gateway}/admin/oidc/clients`, { token: state.adminToken, body: { name: 'Doomed 2', redirectUris: [redirectUri] } })).body.client;
+      const viaDoomed = await signIn(u, password, doomed.clientId);
+      const doomedTokens = await (await exchange(viaDoomed.code, viaDoomed.verifier, doomed.clientId)).json();
+      const viaKept = await signIn(u, password);
+      const keptTokens = await (await exchange(viaKept.code, viaKept.verifier)).json();
+      const direct = await login(u, password);
+      assertEqual((await request('GET', `${CONFIG.gateway}/me`, { token: doomedTokens.access_token })).status, 200, 'before deletion');
+
+      await request('DELETE', `${CONFIG.gateway}/admin/oidc/clients/${doomed.clientId}`, { token: state.adminToken });
+      assertEqual((await request('GET', `${CONFIG.gateway}/me`, { token: doomedTokens.access_token })).status, 401, 'its session on /me');
+      assertEqual((await request('GET', `${CONFIG.gateway}/oauth/userinfo`, { token: doomedTokens.access_token })).status, 401, 'its session on /oauth/userinfo');
+      assertEqual((await request('GET', `${CONFIG.gateway}/me`, { token: keptTokens.access_token })).status, 200, 'a session from another application');
+      assertEqual((await request('GET', `${CONFIG.gateway}/me`, { token: direct })).status, 200, 'a session from /auth/login');
+    });
+
+    await test('A temporary-password page goes stale if the account changes before it is submitted', async () => {
+      const u = await account('bind_temp');
+      await request('POST', `${CONFIG.gateway}/admin/users/${u}/reset-password`, { token: state.adminToken, body: { newPassword: 'Temporary-Pass-9!' } });
+      const { res, blob } = await signIn(u, 'Temporary-Pass-9!');
+      const continuation = ((await res.text()).match(/name="continuation" value="([^"]+)"/) || [])[1];
+      assert(continuation, 'no password-change page');
+      await request('POST', `${CONFIG.gateway}/admin/users/${u}/revoke-sessions`, { token: state.adminToken });
+      const done = await fetch(`${CONFIG.gateway}/oauth/authorize`, form({ request: blob, continuation, step: 'change', new_password: 'Chosen-Pass-9!', confirm_password: 'Chosen-Pass-9!' }));
+      assertEqual(done.status, 400, 'submitting the stale page');
+      assert(!done.headers.get('location'), 'a code was issued');
+      assert(/sign in again/i.test(await done.text()), 'the page should say to sign in again');
+    });
+
+    await test('Signing in on the page leaves an HttpOnly device cookie scoped to the sign-in form', async () => {
+      const u = await account('bind_cookie');
+      const { res } = await signIn(u, password);
+      const cookie = res.headers.get('set-cookie') || '';
+      assert(/^iam_device=d1\./.test(cookie), `cookie: ${cookie.slice(0, 40)}`);
+      for (const attribute of [/HttpOnly/i, /SameSite=Strict/i, /Path=\/oauth\/authorize/i]) assert(attribute.test(cookie), `missing ${attribute}`);
+    });
+  } finally {
+    if (client) await request('DELETE', `${CONFIG.gateway}/admin/oidc/clients/${client.clientId}`, { token: state.adminToken });
+    for (const u of created) await request('DELETE', `${CONFIG.gateway}/admin/users/${u}`, { token: state.adminToken });
+  }
+}
+
+// 19d ─────────────────────────────────────────────────────────────────────────
+async function runRequestBindingTests() {
+  suite('Review fixes — access requests belong to an account, not a name');
+
+  const password = 'Request-Owner-1!';
+  const redis = redisClient();
+  const created = [];
+  const findRequest = async (id) => (await request('GET', `${CONFIG.gateway}/admin/requests`, { token: state.adminToken })).body.requests.find((r) => r.id === id);
+
+  try {
+    await test('Deleting an account cancels its pending requests, platform and tenant alike', async () => {
+      const u = uniqueUser('req_deleted');
+      const token = await createUserAndLogin(u, password);
+      const platform = await request('POST', `${CONFIG.gateway}/requests`, { token, body: { role: 'green_role' } });
+      const tenant = await request('POST', `${CONFIG.gateway}/requests`, { token, body: { tenant: 'llm', role: 'service_user' } });
+      assertEqual(platform.status, 201, 'platform request');
+      assertEqual(tenant.status, 201, 'tenant request');
+
+      await request('DELETE', `${CONFIG.gateway}/admin/users/${u}`, { token: state.adminToken });
+      for (const made of [platform, tenant]) {
+        const after = await findRequest(made.body.request.id);
+        assertEqual(after.status, 'cancelled', 'status');
+        assertEqual(after.reason, 'account-deleted', 'reason');
+      }
+      const queue = await request('GET', `${CONFIG.gateway}/tenants/llm/requests?status=cancelled`, { token: state.adminToken });
+      assert(queue.body.requests.some((r) => r.id === tenant.body.request.id), 'the tenant queue shows it as cancelled');
+
+      // Somebody signs up under the freed name.
+      const newcomer = await createUserAndLogin(u, 'Newcomer-Pass-1!');
+      created.push(u);
+      const mine = await request('GET', `${CONFIG.gateway}/requests/me`, { token: newcomer });
+      assertEqual(mine.body.count, 0, 'requests the newcomer inherited');
+      const approve = await request('POST', `${CONFIG.gateway}/admin/requests/${platform.body.request.id}/approve`, { token: state.adminToken, body: { role: 'green_role' } });
+      assertEqual(approve.status, 409, 'approving the old request');
+      const roles = (await request('GET', `${CONFIG.gateway}/me`, { token: newcomer })).body.roles || [];
+      assert(!roles.includes('green_role'), 'the newcomer was granted the old request\'s role');
+    });
+
+    await test('An approval whose requester has vanished is refused, and the request closed', async () => {
+      const u = uniqueUser('req_orphan');
+      const token = await createUserAndLogin(u, password);
+      created.push(u);
+      const made = await request('POST', `${CONFIG.gateway}/requests`, { token, body: { role: 'green_role' } });
+      const id = await redis.hget(`user:${u}`, 'id');
+      // An account removed by some path that did not tidy up after it.
+      await redis.hdel('users:ids', id);
+      const approve = await request('POST', `${CONFIG.gateway}/admin/requests/${made.body.request.id}/approve`, { token: state.adminToken, body: { role: 'green_role' } });
+      assertEqual(approve.status, 410, 'approve');
+      assertEqual((await findRequest(made.body.request.id)).status, 'cancelled', 'status afterwards');
+      await redis.hset('users:ids', id, u);
+    });
+
+    await test('A request is decided once: approve and reject at the same moment, one wins', async () => {
+      const u = uniqueUser('req_race');
+      const token = await createUserAndLogin(u, password);
+      created.push(u);
+      const made = await request('POST', `${CONFIG.gateway}/requests`, { token, body: { role: 'green_role' } });
+      const id = made.body.request.id;
+      const [approve, reject] = await Promise.all([
+        request('POST', `${CONFIG.gateway}/admin/requests/${id}/approve`, { token: state.adminToken, body: { role: 'green_role' } }),
+        request('POST', `${CONFIG.gateway}/admin/requests/${id}/reject`, { token: state.adminToken }),
+      ]);
+      assertEqual([approve.status, reject.status].sort().join(','), '200,409', 'statuses');
+      const final = await findRequest(id);
+      const hasRole = ((await request('GET', `${CONFIG.gateway}/me`, { token: await login(u, password) })).body.roles || []).includes('green_role');
+      assertEqual(hasRole, final.status === 'approved', `role held vs final status '${final.status}'`);
+    });
+
+    await test('Requests from before ids were recorded are not handed to whoever holds the name now', async () => {
+      const u = uniqueUser('req_legacy');
+      const token = await createUserAndLogin(u, password);
+      created.push(u);
+      const pendingId = randomUUID();
+      const decidedId = randomUUID();
+      const legacy = (id, status) => ({
+        id, username: u, tenant: '', role: 'green_role', service: '', note: '', status,
+        requestedAt: new Date().toISOString(), resolvedAt: '', resolvedBy: '', grantedRole: '',
+      });
+      await redis.hset(`request:${pendingId}`, legacy(pendingId, 'pending'));
+      await redis.hset(`request:${decidedId}`, legacy(decidedId, 'rejected'));
+      await redis.sadd('requests:index', pendingId, decidedId);
+      await redis.sadd(`requests:user:${u}`, pendingId, decidedId);
+      await redis.del('requests:schema');
+
+      const peer = startGateway();
+      try {
+        assert(await peer.ready(), 'the migrating gateway did not start');
+        assertEqual(await redis.hget(`request:${pendingId}`, 'status'), 'cancelled', 'the legacy pending request');
+        assertEqual(await redis.hget(`request:${pendingId}`, 'reason'), 'requester-unverifiable', 'reason');
+        assertEqual(await redis.hget(`request:${decidedId}`, 'status'), 'rejected', 'the legacy decided request is kept as history');
+        assertEqual(await redis.exists(`requests:user:${u}`), 0, 'the per-username index');
+        assertEqual(await redis.get('requests:schema'), '2', 'schema marker');
+      } finally {
+        await peer.stop();
+      }
+      const mine = await request('GET', `${CONFIG.gateway}/requests/me`, { token });
+      assert(!mine.body.requests.some((r) => [pendingId, decidedId].includes(r.id)), 'legacy requests are listed as this account\'s');
+    });
+  } finally {
+    for (const u of created) await request('DELETE', `${CONFIG.gateway}/admin/users/${u}`, { token: state.adminToken });
+    redis.disconnect();
+  }
+}
+
+// 19e ─────────────────────────────────────────────────────────────────────────
+async function runSeedingTests() {
+  suite('Review fixes — a deleted default policy stays deleted across restarts');
+
+  const rule = { subject: 'green_role', resource: '/llm/gemini', action: 'get' };
+  const has = async () => (await request('GET', `${CONFIG.gateway}/admin/policies`, { token: state.adminToken })).body.policies
+    .some((p) => p.subject === rule.subject && p.resource === rule.resource && p.action === rule.action);
+
+  try {
+    await test('An administrator deletes a seeded policy, and a restarted gateway does not put it back', async () => {
+      if (!(await has())) await request('POST', `${CONFIG.gateway}/admin/policies`, { token: state.adminToken, body: rule });
+      assertEqual((await request('DELETE', `${CONFIG.gateway}/admin/policies`, { token: state.adminToken, body: rule })).status, 200, 'delete');
+      const peer = startGateway();
+      try {
+        assert(await peer.ready(), 'the restarted gateway did not come up');
+      } finally {
+        await peer.stop();
+      }
+      assertEqual(await has(), false, 'the policy after a gateway boot');
+    });
+  } finally {
+    if (!(await has())) await request('POST', `${CONFIG.gateway}/admin/policies`, { token: state.adminToken, body: rule });
+  }
+}
+
+// 19f ─────────────────────────────────────────────────────────────────────────
+async function runBootstrapTests() {
+  suite('Review fixes — first boot: the admin password goes to its file or nowhere');
+
+  const fs = require('fs');
+  const scratch = await startScratchRedis();
+  if (!scratch) {
+    skip('First boot', 'needs redis-server on PATH, to start an empty Redis');
+    return;
+  }
+  const passwordFile = path.join(scratch.dir, 'admin-password');
+  const env = (file) => ({ REDIS_URL: scratch.url, INITIAL_ADMIN_PASSWORD_FILE: file });
+
+  try {
+    await test('If the password file cannot be written, the gateway refuses to start and creates nothing', async () => {
+      const gateway = startGateway(env('/dev/null/iam/admin-password'));
+      const code = await Promise.race([gateway.exited, pause(20000).then(() => 'still running')]);
+      if (code === 'still running') await gateway.stop();
+      assertEqual(code, 1, 'exit code');
+      assert(/Refusing to start/.test(gateway.output()), 'it should say why');
+      assert(!/One-time password for 'admin':/.test(gateway.output()), 'a password was printed');
+      assertEqual(await scratch.client.exists('user:admin'), 0, 'an admin account exists');
+      assertEqual(await scratch.client.exists('iam:bootstrap:initial-admin'), 0, 'the bootstrap was marked done');
+    });
+
+    await test('With a writable file it is written there, privately — never to the output — even over a planted symlink', async () => {
+      const elsewhere = path.join(scratch.dir, 'elsewhere');
+      fs.symlinkSync(elsewhere, passwordFile);
+      const gateway = startGateway(env(passwordFile));
+      try {
+        assert(await gateway.ready(), `the gateway did not start: ${gateway.output().slice(-300)}`);
+        assert(!fs.lstatSync(passwordFile).isSymbolicLink(), 'the symlink was followed');
+        assert(!fs.existsSync(elsewhere), 'the password was written through the symlink');
+        assertEqual(fs.statSync(passwordFile).mode & 0o077, 0, 'permissions of the password file');
+        const password = fs.readFileSync(passwordFile, 'utf8').trim();
+        assert(password.length >= 24, 'password length');
+        assert(!gateway.output().includes(password), 'the password appears in the output');
+        assertEqual(await scratch.client.hget('user:admin', 'mustChangePassword'), '1', 'the admin must change it');
+        assertEqual(JSON.parse(await scratch.client.get('iam:bootstrap:defaults')).outcome, 'seeded', 'defaults on a fresh deployment');
+      } finally {
+        await gateway.stop();
+      }
+    });
+
+    await test('A default policy deleted on a fresh deployment is not re-seeded at the next boot', async () => {
+      const row = JSON.stringify({ ptype: 'p', rule: ['r:green_role', '/llm/gemini', 'get'] });
+      assertEqual(await scratch.client.lrem('casbin:policies', 0, row), 1, 'the seeded row was there to delete');
+      await scratch.client.incr('casbin:policies:version');
+      const gateway = startGateway(env(passwordFile));
+      try {
+        assert(await gateway.ready(), 'the gateway did not restart');
+        const rows = await scratch.client.lrange('casbin:policies', 0, -1);
+        assert(!rows.includes(row), 'the deleted default policy came back');
+        assert(rows.includes(JSON.stringify({ ptype: 'p', rule: ['r:blue_role', '/llm/claude', 'get'] })), 'the other defaults are untouched');
+      } finally {
+        await gateway.stop();
+      }
+    });
+  } finally {
+    await scratch.stop();
+  }
+}
+
+// 19g ─────────────────────────────────────────────────────────────────────────
+async function runLockoutTests() {
+  suite('Review fixes — failed sign-ins cannot lock the owner out');
+
+  const password = 'Lockout-Owner-1!';
+  const created = [];
+  // A gateway behind a (loopback) proxy, so each test can speak from any address.
+  const peer = startGateway({ TRUST_PROXY: 'loopback', LOGIN_ACCOUNT_MAX_FAILURES: '8' });
+  const from = (ip, body) => request('POST', `${peer.url}/auth/login`, { body, headers: { 'X-Forwarded-For': ip } });
+  async function victim(prefix) {
+    const u = uniqueUser(prefix);
+    await createUserAndLogin(u, password);
+    created.push(u);
+    return u;
+  }
+
+  try {
+    if (!(await peer.ready())) throw new Error(`the proxied gateway did not start: ${peer.output().slice(-300)}`);
+
+    await test('Five wrong guesses lock out the address that made them — not the account', async () => {
+      const u = await victim('lock_source');
+      for (let i = 0; i < 5; i++) assertEqual((await from('198.51.100.1', { username: u, password: `guess-${i}-xxxx` })).status, 401, `guess ${i + 1}`);
+      assertEqual((await from('198.51.100.1', { username: u, password })).status, 429, 'the guessing address, even with the right password');
+      const owner = await from('203.0.113.50', { username: u, password });
+      assertEqual(owner.status, 200, 'the owner from another address');
+      assert(/^d1\./.test(owner.body.deviceToken || ''), 'a device token is issued');
+    });
+
+    await test('Guesses sprayed from many addresses stop new clients — never a device the owner has used', async () => {
+      const u = await victim('lock_spray');
+      const known = (await from('203.0.113.60', { username: u, password })).body.deviceToken;
+      for (let i = 0; i < 8; i++) assertEqual((await from(`198.51.100.${10 + i}`, { username: u, password: 'sprayed-guess-x' })).status, 401, `spray ${i + 1}`);
+
+      const stranger = await from('203.0.113.61', { username: u, password });
+      assertEqual(stranger.status, 429, 'a new client, right password');
+      assert(/device you have used before/.test(stranger.body.error), `message: ${stranger.body.error}`);
+      assertEqual((await from('203.0.113.62', { username: u, password, deviceToken: known })).status, 200, 'the owner\'s device, from a new address');
+
+      const other = await victim('lock_other');
+      const otherToken = (await from('203.0.113.63', { username: other, password })).body.deviceToken;
+      assertEqual((await from('203.0.113.64', { username: u, password, deviceToken: otherToken })).status, 429, 'another account\'s device token');
+      const forged = `${known.slice(0, -4)}${known.slice(-4) === 'AAAA' ? 'BBBB' : 'AAAA'}`;
+      assertEqual((await from('203.0.113.65', { username: u, password, deviceToken: forged })).status, 429, 'a tampered device token');
+    });
+
+    await test('One address cannot get more attempts by spelling itself differently', async () => {
+      const u = await victim('lock_mapped');
+      for (const ip of ['192.0.2.5', '192.0.2.5', '192.0.2.5', '::ffff:192.0.2.5', '::ffff:192.0.2.5']) {
+        assertEqual((await from(ip, { username: u, password: 'mapped-guess-x' })).status, 401, `guess from ${ip}`);
+      }
+      assertEqual((await from('::ffff:c000:205', { username: u, password })).status, 429, 'sixth attempt, written in hex');
+
+      const v6 = await victim('lock_v6');
+      for (let i = 1; i <= 5; i++) await from(`2001:db8:1:2::${i}`, { username: v6, password: 'v6-guess-xxxx' });
+      assertEqual((await from('2001:db8:1:2::99', { username: v6, password })).status, 429, 'another address in the same /64');
+      assertEqual((await from('2001:db8:1:3::1', { username: v6, password })).status, 200, 'an address in another /64');
+    });
+
+    await test('Without a trusted proxy, X-Forwarded-For is not believed', async () => {
+      const u = await victim('lock_xff');
+      for (let i = 0; i < 5; i++) {
+        await request('POST', `${CONFIG.gateway}/auth/login`, { body: { username: u, password: 'xff-guess-xxxx' }, headers: { 'X-Forwarded-For': `198.51.100.${100 + i}` } });
+      }
+      const res = await request('POST', `${CONFIG.gateway}/auth/login`, { body: { username: u, password }, headers: { 'X-Forwarded-For': '198.51.100.200' } });
+      assertEqual(res.status, 429, 'a sixth attempt claiming yet another address');
+    });
+  } finally {
+    await peer.stop();
+    for (const u of created) await request('DELETE', `${CONFIG.gateway}/admin/users/${u}`, { token: state.adminToken });
+  }
+}
+
+// 19h ─────────────────────────────────────────────────────────────────────────
+async function runTrustProxyTests() {
+  suite('Review fixes — TRUST_PROXY cannot be set to believe everyone; proxy-addr is patched');
+
+  for (const value of ['true', '*', '0.0.0.0/0', '::/0', '::/64', '6', 'not-an-address']) {
+    await test(`TRUST_PROXY=${value} stops the gateway at startup`, async () => {
+      const gateway = startGateway({ TRUST_PROXY: value });
+      const code = await Promise.race([gateway.exited, pause(15000).then(() => 'still running')]);
+      if (code === 'still running') await gateway.stop();
+      assertEqual(code, 1, 'exit code');
+      assert(/TRUST_PROXY is not acceptable/.test(gateway.output()), `output: ${gateway.output().slice(0, 200)}`);
+    });
+  }
+
+  await test('proxy-addr is 2.0.8 or later, and an IPv6 trust range no longer trusts IPv4 clients', async () => {
+    const { version } = require('proxy-addr/package.json');
+    const [major, minor, patch] = version.split('.').map(Number);
+    assert(major > 2 || (major === 2 && (minor > 0 || patch >= 8)), `proxy-addr ${version}`);
+    const proxyaddr = require('proxy-addr');
+    assertEqual(proxyaddr.compile('::/64')('203.0.113.9', 0), false, 'IPv4 client under an IPv6 trust range');
+    assertEqual(proxyaddr.compile('::ffff:203.0.113.0/120')('203.0.113.9', 0), true, 'an IPv4-mapped trust range still works');
+  });
+}
+
 // ── 6b. SELF-SERVICE ACCESS REQUESTS ─────────────────────────────────────────
 
 async function runAccessRequestTests() {
@@ -4770,7 +5407,10 @@ async function runTenancyTests() {
       assertEqual(res.status, 200, 'status');
       assertEqual(res.body.username, member, 'username');
       assertEqual(res.body.mode, 'live-call', 'mode');
-      assertEqual(res.body.token.value, tokens.member, 'the token shown is the caller\'s own, not a new one');
+      // The caller's own token, not a new one — identified by its id, and not repeated in full.
+      assertEqual(res.body.token.claims.jti, claimsOf(tokens.member).jti, 'the token described is the caller\'s own');
+      assertEqual(res.body.token.masked, true, 'masked');
+      assert(!JSON.stringify(res.body).includes(tokens.member), 'the full token is repeated in the report');
 
       const svc = res.body.services.find((x) => x.service === tenantId);
       const allowed = svc.endpoints.find((e) => e.endpoint === endpoints[0]);
@@ -4925,6 +5565,14 @@ async function main() {
     { name: 'Proxy Fidelity', fn: runProxyFidelityTests },
     { name: 'Policy Sync', fn: runPolicySyncTests },
     { name: 'Operations', fn: runOperationsTests },
+    { name: 'Review: self-test redirects', fn: runSelfProbeRedirectTests },
+    { name: 'Review: registry races', fn: runRegistryRaceTests },
+    { name: 'Review: OIDC grant binding', fn: runOidcBindingTests },
+    { name: 'Review: request binding', fn: runRequestBindingTests },
+    { name: 'Review: default policies', fn: runSeedingTests },
+    { name: 'Review: first boot', fn: runBootstrapTests },
+    { name: 'Review: sign-in lockout', fn: runLockoutTests },
+    { name: 'Review: trusted proxies', fn: runTrustProxyTests },
     { name: 'Swagger', fn: runSwaggerTests },
   ];
 

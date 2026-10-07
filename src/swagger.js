@@ -70,6 +70,10 @@ const spec = {
         properties: {
           username: { type: 'string', example: 'alice' },
           password: { type: 'string', example: 'SecurePass123!' },
+          deviceToken: {
+            type: 'string',
+            description: 'Login only, optional: the `deviceToken` an earlier successful login from this client returned.',
+          },
         },
       },
       LoginResponse: {
@@ -83,6 +87,12 @@ const spec = {
               'Present (and true) only when the account still holds a temporary password. ' +
               'The token then opens nothing except `POST /auth/change-password` and `POST /auth/logout`; ' +
               'every other route answers 403 with `code: "PASSWORD_CHANGE_REQUIRED"`.',
+          },
+          deviceToken: {
+            type: 'string',
+            description:
+              'Identifies this client to this account for later logins. Not a credential: it only means ' +
+              'that guesses made at the username from elsewhere do not lock this client out.',
           },
         },
       },
@@ -172,11 +182,12 @@ const spec = {
         type: 'object',
         properties: {
           id:          { type: 'string', format: 'uuid' },
-          username:    { type: 'string', example: 'alice' },
+          username:    { type: 'string', example: 'alice', description: 'Who asked, as they were named then. The request belongs to that ACCOUNT (by id), not to the name: deleting the account cancels it, and a new account under the same name does not inherit it.' },
           role:        { type: 'string', nullable: true, example: 'blue_role' },
           service:     { type: 'string', nullable: true, example: 'llm' },
           note:        { type: 'string', example: 'need LLM access for a demo' },
-          status:      { type: 'string', enum: ['pending', 'approved', 'rejected'] },
+          status:      { type: 'string', enum: ['pending', 'approved', 'rejected', 'cancelled'], description: 'Leaves `pending` exactly once' },
+          reason:      { type: 'string', nullable: true, example: 'account-deleted', description: 'Why a request was cancelled without a decision' },
           requestedAt: { type: 'string', format: 'date-time' },
           resolvedAt:  { type: 'string', format: 'date-time', nullable: true },
           resolvedBy:  { type: 'string', nullable: true, example: 'admin' },
@@ -251,9 +262,14 @@ const spec = {
           'read from the store on every request, so a token never outlives a suspension, a ' +
           'deletion, or any loss of access.\n\n' +
           'A failed login always answers `401 Invalid username or password`, whether or not the ' +
-          'username exists, and takes the same time either way. Attempts are limited per address ' +
-          'and per username (existing or not); the limit is taken before the password is checked, ' +
-          'so parallel guesses cannot exceed it.\n\n' +
+          'username exists, and takes the same time either way. Attempts are limited per address, ' +
+          'per username-and-address, and per username for clients the account has not signed in ' +
+          'from before; each limit is taken before the password is checked, so parallel guesses ' +
+          'cannot exceed it. Wrong guesses never lock the owner out: they lock out the address ' +
+          'that made them, and a flood from many addresses stops only unrecognised clients.\n\n' +
+          'A successful login returns a `deviceToken`. Send it back with later logins from the same ' +
+          'client: while somebody is guessing at the username elsewhere, it is what lets this client ' +
+          'in. It signs nobody in by itself.\n\n' +
           'There is no built-in account password. The initial `admin` account is created once, ' +
           'the first time the gateway boots against an empty store, with a random one-time password ' +
           'written to a file on the gateway host; logging in with it returns `mustChangePassword: true`.',
@@ -266,6 +282,10 @@ const spec = {
                 regularUser: {
                   summary: 'Regular user',
                   value: { username: 'alice', password: 'SecurePass123!' },
+                },
+                knownDevice: {
+                  summary: 'From a client that has signed in before',
+                  value: { username: 'alice', password: 'SecurePass123!', deviceToken: 'd1.eyJ1Ijoi…' },
                 },
               },
             },
@@ -293,7 +313,7 @@ const spec = {
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           429: {
-            description: 'Too many attempts from this address or for this username; see `Retry-After`',
+            description: 'Too many attempts — from this address, for this username from this address, or for this username from clients it does not recognise; see `Retry-After`',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
         },
@@ -442,7 +462,9 @@ const spec = {
         description:
           'A code works once, within 60 seconds, for the client and redirect URI it was issued to, ' +
           'and only with the verifier matching its challenge. Presenting a code a second time is ' +
-          'refused and revokes the token issued the first time. Browser clients may call this from ' +
+          'refused and revokes the token issued the first time. A code is also refused if the ' +
+          'account changed after signing in (password changed, suspended, sessions ended, deleted) ' +
+          'or the client has been deleted; deleting a client ends every session issued through it. Browser clients may call this from ' +
           'the origin of a registered redirect URI.',
         requestBody: {
           required: true,
@@ -1101,7 +1123,7 @@ const spec = {
         summary: 'List access requests (optionally filtered by status)',
         security: [{ BearerAuth: [] }],
         parameters: [
-          { in: 'query', name: 'status', schema: { type: 'string', enum: ['pending', 'approved', 'rejected'] } },
+          { in: 'query', name: 'status', schema: { type: 'string', enum: ['pending', 'approved', 'rejected', 'cancelled'] } },
         ],
         responses: {
           200: {
@@ -1143,8 +1165,9 @@ const spec = {
           400: { description: 'No role attached and none provided' },
           401: { description: 'Missing or invalid token' },
           403: { description: 'Admin privileges required' },
-          404: { description: 'Request, user, or role not found' },
-          409: { description: 'Request already resolved' },
+          404: { description: 'Request or role not found' },
+          409: { description: 'Request already resolved — including by a simultaneous approve or reject' },
+          410: { description: 'The account that made the request no longer exists; the request has been closed' },
         },
       },
     },
@@ -1394,7 +1417,7 @@ const spec = {
             },
           },
           400: { description: 'Missing baseUrl, invalid or reserved name, or an endpoint outside the service namespace' },
-          409: { description: 'Name already registered at a different baseUrl and no valid serviceToken was supplied' },
+          409: { description: 'The name is registered (and no valid serviceToken was supplied), is being registered by another request at this moment, or the record changed while this registration was being prepared. A new name is reserved atomically, so of simultaneous registrations exactly one succeeds' },
         },
       },
     },
@@ -1462,6 +1485,7 @@ const spec = {
           400: { description: 'Invalid field', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
           403: { description: 'Missing or wrong service token', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
           404: { description: 'No such service', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+          409: { description: 'The record changed (or was re-registered) while this update was being prepared — read it again and retry', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
         },
       },
       get: {
@@ -1512,6 +1536,7 @@ const spec = {
           200: { description: 'Removed from registry' },
           403: { description: 'Missing or wrong service token' },
           404: { description: 'Not found' },
+          409: { description: 'The record was re-registered by someone else meanwhile; it was not removed' },
         },
       },
     },
@@ -1534,6 +1559,7 @@ const spec = {
           200: { description: 'Renewed; returns the current record' },
           403: { description: 'Missing or wrong service token' },
           404: { description: 'No such service — register it' },
+          409: { description: 'The record was replaced meanwhile; nothing was renewed' },
         },
       },
     },
@@ -1802,7 +1828,10 @@ const spec = {
           + 'Each endpoint reports the request that was sent and the status, headers and body that '
           + 'came back (`mode: "live-call"`). This is the only access test that makes real calls: '
           + 'the admin-facing ones evaluate policy without any token, because there the account '
-          + 'belongs to somebody else.',
+          + 'belongs to somebody else.\n\n'
+          + 'A redirect from a service is reported, never followed (`redirect.followed: false`): '
+          + 'following it would send your token wherever the service pointed. The token itself is '
+          + 'shown shortened (`masked: true`) and identified by its `jti` claim.',
         security: [{ BearerAuth: [] }],
         responses: {
           200: {
@@ -1814,8 +1843,8 @@ const spec = {
               token: {
                 type: 'object',
                 properties: {
-                  value: { type: 'string' },
-                  masked: { type: 'boolean' },
+                  value: { type: 'string', description: 'Shortened — enough to recognise, not to use' },
+                  masked: { type: 'boolean', example: true },
                   header: { type: 'object' },
                   claims: { type: 'object' },
                   expiresInSeconds: { type: 'integer' },
@@ -1841,7 +1870,10 @@ const spec = {
                   explanation: { type: 'string', nullable: true, description: 'Plain-language reason, matched to stoppedBy' },
                   deniedBy: { type: 'string', nullable: true, deprecated: true, description: 'Former name for stoppedBy; kept for existing clients' },
                   latencyMs: { type: 'integer' },
-                  request: { type: 'object', properties: { method: { type: 'string' }, url: { type: 'string' }, headers: { type: 'object' } } },
+                  request: { type: 'object', properties: { method: { type: 'string' }, url: { type: 'string' }, headers: { type: 'object', description: 'Authorization is shown as a placeholder' } } },
+                  redirect: { type: 'object', nullable: true, description: 'Present for a 3xx answer', properties: {
+                    location: { type: 'string' }, followed: { type: 'boolean', example: false },
+                  } },
                   response: { type: 'object', nullable: true, properties: {
                     status: { type: 'integer' }, statusText: { type: 'string' },
                     headers: { type: 'object' }, json: {}, text: { type: 'string', nullable: true },
@@ -1928,7 +1960,7 @@ const spec = {
         tags: ['Tenants'],
         summary: "This tenant's own access-request queue (tenant admin)",
         security: [{ BearerAuth: [] }],
-        parameters: [{ name: 'status', in: 'query', schema: { type: 'string', enum: ['pending', 'approved', 'rejected'] } }],
+        parameters: [{ name: 'status', in: 'query', schema: { type: 'string', enum: ['pending', 'approved', 'rejected', 'cancelled'] } }],
         responses: { 200: { description: 'Requests addressed to this tenant' } },
       },
     },
@@ -1943,7 +1975,7 @@ const spec = {
         summary: 'Approve a request and grant the role — no platform admin needed',
         security: [{ BearerAuth: [] }],
         requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { role: { type: 'string' } } } } } },
-        responses: { 200: { description: 'Approved and granted' }, 409: { description: 'Already resolved' } },
+        responses: { 200: { description: 'Approved and granted' }, 409: { description: 'Already resolved' }, 410: { description: 'The requesting account no longer exists; the request has been closed' } },
       },
     },
 

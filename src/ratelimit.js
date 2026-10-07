@@ -73,7 +73,18 @@ function createRateLimiter(redis, { prefix = 'ratelimit', onLimited } = {}) {
     await redis.del(keyFor(bucket, id));
   }
 
-  return { take, refund, reset };
+  /** Forgets every counter in `bucket` whose id starts with `idPrefix`. */
+  async function resetPrefix(bucket, idPrefix) {
+    const pattern = `${keyFor(bucket, idPrefix).replace(/[*?[\]\\]/g, '\\$&')}*`;
+    let cursor = '0';
+    do {
+      const [next, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 500);
+      if (keys.length) await redis.del(...keys);
+      cursor = next;
+    } while (cursor !== '0');
+  }
+
+  return { take, refund, reset, resetPrefix };
 }
 
 module.exports = { createRateLimiter };

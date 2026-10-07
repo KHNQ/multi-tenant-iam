@@ -304,7 +304,7 @@ export class TenantPanel {
         <h3>Access requests</h3>
         <div class="row" style="margin-bottom:10px">
           <select data-request-filter>
-            ${['pending', '', 'approved', 'rejected'].map((v) => `
+            ${['pending', '', 'approved', 'rejected', 'cancelled'].map((v) => `
               <option value="${v}" ${v === this.state.requestFilter ? 'selected' : ''}>${v || 'all'}</option>`).join('')}
           </select>
           <span class="muted">People asking for a role here. Approving grants it immediately.</span>

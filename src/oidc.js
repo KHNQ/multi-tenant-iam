@@ -32,6 +32,15 @@
  *
  * The access token is the gateway's ordinary session token, so everything
  * else about a session — suspension, revocation, budgets — applies unchanged.
+ *
+ * A grant does not outlive what it was granted on:
+ *   - a code is bound to the account's security version at the moment of
+ *     sign-in, and the exchange refuses it if that has moved since — so a
+ *     password change, suspension, session revocation or deletion between
+ *     sign-in and exchange leaves the code worthless;
+ *   - a code is refused once its client has been deleted, and every access
+ *     token carries the client it was issued to (`cid`), which the gateway
+ *     checks on each request — deleting a client ends its sessions.
  */
 
 const crypto = require('crypto');
@@ -48,6 +57,21 @@ const CLIENTS_INDEX = 'oidc:clients';
 const clientKey = (id) => `oidc:client:${id}`;
 const codeKey = (hash) => `oidc:code:${hash}`;
 const usedCodeKey = (hash) => `oidc:code-used:${hash}`;
+
+// Remembers which client a browser has signed in from before (device-trust.js):
+// HttpOnly, sent only to the sign-in form, never to an application.
+const DEVICE_COOKIE = 'iam_device';
+const DEVICE_COOKIE_PATH = '/oauth/authorize';
+
+function readCookie(req, name) {
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const at = part.indexOf('=');
+    if (at > 0 && part.slice(0, at).trim() === name) {
+      try { return decodeURIComponent(part.slice(at + 1).trim()); } catch { return null; }
+    }
+  }
+  return null;
+}
 
 /** The console that ships with the gateway is a client like any other. */
 const CONSOLE_CLIENT_ID = 'iam-console';
@@ -88,10 +112,14 @@ function redirectUriProblem(value) {
  * @param {object} deps.log
  * @param {string} deps.issuer          the gateway's public URL
  * @param {string} deps.secret          JWT_SECRET, from which storage and form keys are derived
- * @param {Function} deps.checkCredentials  (username, password, ip) -> { account } | { refusal }
- * @param {Function} deps.issueAccessToken  (account id) -> Promise<{ token, jti, exp, username } | null>
+ * @param {Function} deps.checkCredentials  (username, password, ip, { deviceToken }) ->
+ *   { account: { id, username, securityVersion, mustChangePassword }, deviceToken } | { refusal }
+ * @param {Function} deps.issueAccessToken  (account id, { securityVersion, clientId }) ->
+ *   Promise<{ token, jti, exp, username } | null> — null unless the account is still active
+ *   AND still at that security version
  * @param {Function} deps.revokeAccessToken ({ jti, exp }) -> Promise<void>
- * @param {Function} deps.replaceTemporaryPassword (username, newPassword) -> Promise<string|null> problem
+ * @param {Function} deps.replaceTemporaryPassword (username, newPassword, { userId, securityVersion }) ->
+ *   Promise<{ securityVersion } | { problem }>
  * @param {Function} deps.passwordProblem   (password) -> string|null
  */
 function createOidcProvider({
@@ -344,11 +372,16 @@ ${body}
     return loginPage(res, 200, { request, blob: signBlob(request, AUTH_REQUEST_TTL_SECONDS), client });
   }
 
-  async function issueCode(res, request, userId) {
+  /**
+   * @param {number} securityVersion the account's security version when it
+   *   authenticated — the exchange is refused if it has moved since.
+   */
+  async function issueCode(res, request, userId, securityVersion) {
     const code = randomToken();
     await redis.set(codeKey(b64url(sha256(code))), JSON.stringify({
       clientId: request.clientId, redirectUri: request.redirectUri, scope: request.scope,
-      nonce: request.nonce, challenge: request.challenge, userId, authTime: Math.floor(Date.now() / 1000),
+      nonce: request.nonce, challenge: request.challenge, userId, securityVersion,
+      authTime: Math.floor(Date.now() / 1000),
     }), 'EX', CODE_TTL_SECONDS);
 
     const target = new URL(request.redirectUri);
@@ -375,23 +408,37 @@ ${body}
       }
       const weak = passwordProblem(form.new_password);
       if (weak) return again(`The new password ${weak}.`);
-      const problem = await replaceTemporaryPassword(continuation.username, form.new_password);
-      if (problem) return again(problem);
-      return issueCode(res, request, continuation.userId);
+      const replaced = await replaceTemporaryPassword(continuation.username, form.new_password, {
+        userId: continuation.userId, securityVersion: continuation.securityVersion,
+      });
+      if (replaced.problem) return again(replaced.problem);
+      return issueCode(res, request, continuation.userId, replaced.securityVersion);
     }
 
     if (typeof form.username !== 'string' || typeof form.password !== 'string'
         || !form.username.trim() || form.username.length > 128 || form.password.length > 1024) {
       return loginPage(res, 400, { request, blob: form.request, client }, 'Enter your username and password.');
     }
-    const { account, refusal } = await checkCredentials(form.username.trim(), form.password, req.ip);
+    const { account, deviceToken, refusal } = await checkCredentials(form.username.trim(), form.password, req.ip, {
+      deviceToken: readCookie(req, DEVICE_COOKIE),
+    });
     if (refusal) return loginPage(res, refusal.status, { request, blob: form.request, client }, refusal.error);
 
+    res.cookie(DEVICE_COOKIE, deviceToken, {
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: issuer.startsWith('https:'),
+      path: DEVICE_COOKIE_PATH,
+      maxAge: 180 * 24 * 60 * 60 * 1000,
+    });
+
     if (account.mustChangePassword === '1') {
-      const continuation = signBlob({ kind: 'change', userId: account.id, username: account.username }, CONTINUATION_TTL_SECONDS);
+      const continuation = signBlob({
+        kind: 'change', userId: account.id, username: account.username, securityVersion: account.securityVersion,
+      }, CONTINUATION_TTL_SECONDS);
       return changePasswordPage(res, 200, { request, blob: form.request }, continuation);
     }
-    return issueCode(res, request, account.id);
+    return issueCode(res, request, account.id, account.securityVersion);
   }
 
   // ── /oauth/token ─────────────────────────────────────────────────────────
@@ -435,8 +482,28 @@ ${body}
       return tokenError(res, 'invalid_grant', 'code_verifier does not match the code_challenge');
     }
 
-    const accessToken = await issueAccessToken(grant.userId);
-    if (!accessToken) return tokenError(res, 'invalid_grant', 'The account can no longer sign in');
+    // The client may have been deleted, or lost this redirect URI, since the
+    // code was issued: its grants go with it.
+    const client = await getClient(grant.clientId);
+    if (!client || !client.redirectUris.includes(grant.redirectUri)) {
+      log.audit('oidc', 'A code was presented for an application that is no longer registered', { clientId: grant.clientId });
+      return tokenError(res, 'invalid_grant', 'The application this code was issued to is no longer registered');
+    }
+    // A code made before this version-binding existed carries none; it is
+    // at most a minute old, and refusing it costs one more sign-in.
+    if (!Number.isInteger(grant.securityVersion)) {
+      return tokenError(res, 'invalid_grant', 'The authorization code is invalid, expired or already used');
+    }
+
+    const accessToken = await issueAccessToken(grant.userId, {
+      securityVersion: grant.securityVersion, clientId: grant.clientId,
+    });
+    if (!accessToken) {
+      log.audit('oidc', 'A code was refused: the account changed (revoked, suspended, deleted or re-secured) after signing in', {
+        clientId: grant.clientId, userId: grant.userId,
+      });
+      return tokenError(res, 'invalid_grant', 'The account can no longer sign in with this code — sign in again');
+    }
     // Remembered for a while, as the token's id only — enough to revoke it
     // if this code turns up again, and not a credential in itself.
     await redis.set(usedCodeKey(hash), JSON.stringify({ jti: accessToken.jti, exp: accessToken.exp }), 'EX', 10 * 60);
@@ -517,4 +584,4 @@ ${body}
   };
 }
 
-module.exports = { createOidcProvider, redirectUriProblem, CONSOLE_CLIENT_ID };
+module.exports = { createOidcProvider, redirectUriProblem, CONSOLE_CLIENT_ID, oidcClientKey: clientKey };

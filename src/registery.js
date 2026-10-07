@@ -281,25 +281,120 @@ function safeParseEndpoints(raw) {
 
 // --- REGISTRY DATA ACCESS LAYER ---
 // All Redis interactions live here so the route handlers stay clean.
+//
+// WRITES ARE CONDITIONAL. A registration is a read, then work that can take
+// seconds (resolving and checking destinations, fetching the catalog), then a
+// write. Done as "read, check, HSET", two callers could both see a name as
+// free and both "win" — the second silently replacing the first's
+// destination — and an owner whose name was deregistered and re-registered by
+// someone else mid-flight could write their old record, and their old token,
+// back over the new one. So:
+//
+//   - a NEW name is reserved atomically before any of that work (SET NX on a
+//     short-lived reservation key, refused if the record or another
+//     reservation exists), and created only by the holder of the reservation;
+//   - an EXISTING record carries a revision, and a change is committed only
+//     if the revision and the token hash are still the ones it was
+//     authorised against — otherwise the caller is told to read it again.
+// Each of these is one Lua script, so the check and the write cannot be split.
+
+const RESERVATION_TTL_MS = 60 * 1000;
+const reservationKey = (name) => `registry:reservation:${name}`;
+
+redis.defineCommand('reserveServiceName', {
+  numberOfKeys: 2,
+  lua: `
+    if redis.call('EXISTS', KEYS[1]) == 1 then return 'exists' end
+    if redis.call('SET', KEYS[2], ARGV[1], 'NX', 'PX', ARGV[2]) then return 'ok' end
+    return 'reserved'
+  `,
+});
+
+redis.defineCommand('releaseServiceName', {
+  numberOfKeys: 1,
+  lua: `
+    if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+    return 0
+  `,
+});
+
+// KEYS: record, index, reservation.
+// ARGV: mode ('create' | 'update'), name,
+//       reservationId (create) or expectedRevision (update),
+//       expectedTokenHash (update; '' for create), then field, value, …
+redis.defineCommand('commitService', {
+  numberOfKeys: 3,
+  lua: `
+    if ARGV[1] == 'create' then
+      if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+      if redis.call('GET', KEYS[3]) ~= ARGV[3] then return 0 end
+    else
+      if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+      if (redis.call('HGET', KEYS[1], 'tokenHash') or '') ~= ARGV[4] then return 0 end
+      if tonumber(redis.call('HGET', KEYS[1], 'revision') or '0') ~= tonumber(ARGV[3]) then return 0 end
+    end
+    redis.call('HSET', KEYS[1], unpack(ARGV, 5))
+    if ARGV[1] == 'create' then
+      redis.call('HSET', KEYS[1], 'revision', 1)
+      redis.call('DEL', KEYS[3])
+    else
+      redis.call('HINCRBY', KEYS[1], 'revision', 1)
+    end
+    redis.call('SADD', KEYS[2], ARGV[2])
+    return 1
+  `,
+});
+
+// KEYS: record, index. ARGV: name, expectedTokenHash.
+// Removes the record only if it is still the one the caller was authorised
+// against; an index entry with no record behind it is simply dropped.
+redis.defineCommand('deleteServiceIf', {
+  numberOfKeys: 2,
+  lua: `
+    if redis.call('EXISTS', KEYS[1]) == 0 then
+      redis.call('SREM', KEYS[2], ARGV[1])
+      return 1
+    end
+    if (redis.call('HGET', KEYS[1], 'tokenHash') or '') ~= ARGV[2] then return 0 end
+    redis.call('DEL', KEYS[1])
+    redis.call('SREM', KEYS[2], ARGV[1])
+    return 1
+  `,
+});
+
+/** Flattens a serialised record into field, value, … for the scripts above. */
+const fieldList = (fields) => Object.entries(fields).flatMap(([key, value]) => [key, String(value ?? '')]);
 
 /**
- * Persist a service entry to Redis.
- * Uses a pipeline so both writes happen atomically in one round trip.
- *
- * @param {string} name      - service identifier / map key
- * @param {object} serviceData
+ * Creates a record under a reservation this caller holds.
+ * @returns {Promise<boolean>} false if the reservation is gone or the name was taken
  */
-async function saveService(name, serviceData) {
-  const pipeline = redis.pipeline();
-
-  // Store all fields as a Hash
-  pipeline.hset(REDIS_KEYS.service(name), serialiseService(serviceData));
-
-  // Add the name to the master index Set
-  pipeline.sadd(REDIS_KEYS.serviceIndex(), name);
-
-  await pipeline.exec();
+async function createService(name, reservationId, serviceData) {
+  return (await redis.commitService(
+    REDIS_KEYS.service(name), REDIS_KEYS.serviceIndex(), reservationKey(name),
+    'create', name, reservationId, '', ...fieldList(serialiseService(serviceData)),
+  )) === 1;
 }
+
+/**
+ * Writes `fields` (already in stored form) to an existing record if it is
+ * still at `revision` with `tokenHash` — i.e. still the record the caller was
+ * authorised to change.
+ * @returns {Promise<boolean>}
+ */
+async function updateService(name, { revision, tokenHash }, fields) {
+  return (await redis.commitService(
+    REDIS_KEYS.service(name), REDIS_KEYS.serviceIndex(), reservationKey(name),
+    'update', name, String(revision), tokenHash || '', ...fieldList(fields),
+  )) === 1;
+}
+
+const revisionOf = (raw) => Number.parseInt(raw?.revision, 10) || 0;
+
+const changedMeanwhile = (res, name) => res.status(409).json({
+  error: `Service '${name}' was changed or re-registered while this request was being processed`,
+  hint: 'Read it again (GET /services/:name) and retry if the change is still wanted.',
+});
 
 /**
  * Retrieve a single service by name, including its token hash.
@@ -359,19 +454,6 @@ async function getAllServices() {
 
   services.sort((a, b) => a.name.localeCompare(b.name));
   return services;
-}
-
-/**
- * Remove a service from Redis completely.
- * Uses a pipeline to delete both the Hash and the Set membership.
- *
- * @param {string} name
- */
-async function deleteService(name) {
-  const pipeline = redis.pipeline();
-  pipeline.del(REDIS_KEYS.service(name));
-  pipeline.srem(REDIS_KEYS.serviceIndex(), name);
-  await pipeline.exec();
 }
 
 /**
@@ -499,10 +581,13 @@ async function refuseDestinations(urls, warnings) {
 
 // Updates health/lastSeen if — and only if — the record still exists, so a
 // probe that finishes after a deregistration cannot bring half a record back.
+// A heartbeat also names the token hash it was authorised against, so it
+// cannot mark live a record that was replaced by somebody else meanwhile.
 redis.defineCommand('touchServiceLifecycle', {
   numberOfKeys: 1,
   lua: `
     if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+    if ARGV[3] and ARGV[3] ~= '' and (redis.call('HGET', KEYS[1], 'tokenHash') or '') ~= ARGV[3] then return 0 end
     redis.call('HSET', KEYS[1], 'health', ARGV[1])
     if ARGV[2] ~= '' then redis.call('HSET', KEYS[1], 'lastSeen', ARGV[2]) end
     return 1
@@ -514,9 +599,9 @@ redis.defineCommand('touchServiceLifecycle', {
  * @param {'ok'|'unreachable'} health
  * @returns {Promise<boolean>} false if there is no such service
  */
-async function recordLiveness(name, health) {
+async function recordLiveness(name, health, expectedTokenHash = '') {
   const seenAt = health === 'ok' ? new Date().toISOString() : '';
-  return (await redis.touchServiceLifecycle(REDIS_KEYS.service(name), health, seenAt)) === 1;
+  return (await redis.touchServiceLifecycle(REDIS_KEYS.service(name), health, seenAt, expectedTokenHash)) === 1;
 }
 
 /**
@@ -635,6 +720,8 @@ app.post('/register', validate({
   const existing = existingRaw ? deserialiseService(existingRaw) : null;
   let tokenHash = existingRaw?.tokenHash || '';
   let issuedToken = null;
+  // A new name is held from here until it is written or this request gives up.
+  let reservation = null;
 
   if (existing) {
     // The caller asked for "create, or nothing". The gateway sends this when
@@ -668,13 +755,31 @@ app.post('/register', validate({
           : 'Register it through the gateway (POST /tenants/register). Direct self-registration is switched off: no REGISTRY_ENROLLMENT_TOKEN is configured.',
       });
     }
+    // Claim the name before doing anything slow. Of two callers registering
+    // the same new name at once, exactly one gets past this line.
+    reservation = crypto.randomUUID();
+    const claim = await redis.reserveServiceName(REDIS_KEYS.service(name), reservationKey(name), reservation, RESERVATION_TTL_MS);
+    if (claim !== 'ok') {
+      log.warn('registry', `Rejected registration of '${name}': the name is ${claim === 'exists' ? 'already registered' : 'being registered by another request'}`, { name, baseUrl });
+      return res.status(409).json({
+        error: `Service '${name}' is ${claim === 'exists' ? 'already registered' : 'being registered by another request'}`,
+        hint: 'Pick a different name. An existing service can only be changed by its owner.',
+      });
+    }
     const token = mintServiceToken();
     tokenHash = hashToken(token);
     issuedToken = token;
   }
 
+  // Every way out of this handler that does not create the record gives the
+  // reservation back, so a failed attempt does not hold the name for a minute.
+  const giveUp = async () => {
+    if (reservation) await redis.releaseServiceName(reservationKey(name), reservation);
+  };
+
   const refused = await refuseDestinations({ baseUrl, catalogUrl }, warnings);
   if (refused) {
+    await giveUp();
     log.warn('registry', `Rejected registration of '${name}': ${refused}`, { name, baseUrl, catalogUrl });
     return res.status(400).json({
       error: refused,
@@ -704,6 +809,7 @@ app.post('/register', validate({
       if (catalog.name && catalog.name !== name) {
         const collidesWith = await serviceExists(catalog.name);
         if (collidesWith && !existing && req.body.allowAlias !== true) {
+          await giveUp();
           log.warn('registry', `Rejected '${name}': its catalog identifies as the already-registered service '${catalog.name}'`, {
             name, catalogName: catalog.name, catalogUrl,
           });
@@ -778,7 +884,17 @@ app.post('/register', validate({
     lastSeen: catalog ? new Date().toISOString() : (existing?.lastSeen ?? new Date().toISOString()),
   };
 
-  await saveService(name, serviceEntry);
+  // The write happens only if nothing moved underneath: a new name still held
+  // by this request, or the existing record still at the revision and token
+  // this request was authorised against.
+  const committed = existing
+    ? await updateService(name, { revision: revisionOf(existingRaw), tokenHash: existingRaw.tokenHash }, serialiseService(serviceEntry))
+    : await createService(name, reservation, serviceEntry);
+  if (!committed) {
+    await giveUp();
+    log.warn('registry', `Registration of '${name}' not written: the record changed while it was being prepared`, { name, baseUrl });
+    return changedMeanwhile(res, name);
+  }
 
   log.audit('registry', `Service '${name}' registered`, { name, baseUrl, warnings });
 
@@ -864,11 +980,14 @@ app.patch('/services/:name', validate({
   }
 
   // Only the fields being changed are written, so an edit can never carry a
-  // stale health or lastSeen over a liveness update that landed meanwhile.
-  await redis.hset(REDIS_KEYS.service(name), {
+  // stale health or lastSeen over a liveness update that landed meanwhile —
+  // and only if the record is still the one this caller was authorised to
+  // change (a catalog sync can take seconds).
+  const committed = await updateService(name, { revision: revisionOf(raw), tokenHash: raw.tokenHash }, {
     ...patch,
     ...(patch.endpoints ? { endpoints: JSON.stringify(patch.endpoints) } : {}),
   });
+  if (!committed) return changedMeanwhile(res, name);
 
   log.audit('registry', `Service '${name}' updated`, { name, fields: Object.keys(patch) });
   res.json({ message: `Service '${name}' updated`, service: { ...(await getService(name)), name }, warnings });
@@ -898,7 +1017,7 @@ app.post('/services/:name/heartbeat', validate({
     return res.status(403).json({ error: 'A valid serviceToken is required to renew this service' });
   }
 
-  await recordLiveness(name, 'ok');
+  if (!(await recordLiveness(name, 'ok', raw.tokenHash || ''))) return changedMeanwhile(res, name);
   res.json({ message: `Service '${name}' renewed`, service: { ...(await getService(name)), name } });
 });
 
@@ -971,7 +1090,8 @@ app.delete('/services/:name', validate({
       return res.status(403).json({ error: 'A valid serviceToken is required to deregister this service' });
     }
 
-    await deleteService(name);
+    const removed = await redis.deleteServiceIf(REDIS_KEYS.service(name), REDIS_KEYS.serviceIndex(), name, raw?.tokenHash || '');
+    if (removed !== 1) return changedMeanwhile(res, name);
 
     log.audit('registry', `Service '${name}' deregistered`, { name });
     res.json({ message: `Service '${name}' removed from registry` });

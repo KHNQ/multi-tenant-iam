@@ -242,7 +242,12 @@ function createTenancy({ redis, withCasbin, getEnforcer, userSubjectFor, addPoli
    */
   async function createTenant({ id, displayName, description, baseUrl, owner, source = 'manual', seedDefaults = true }) {
     const now = new Date().toISOString();
-    const existing = await getTenant(id);
+    // Claimed atomically: of two callers creating the same tenant at once
+    // (a registration and the periodic sync, say), exactly one creates it and
+    // the other takes the existing-tenant path below — so an owner written by
+    // one can never be overwritten by the other's blank record.
+    const claimed = await redis.hsetnx(tenantKey(id), 'id', id);
+    const existing = claimed ? null : await getTenant(id);
 
     if (existing) {
       const patch = {};
@@ -268,12 +273,13 @@ function createTenancy({ redis, withCasbin, getEnforcer, userSubjectFor, addPoli
       displayName: displayName || id,
       description: description || '',
       baseUrl: baseUrl || '',
-      owner: owner || '',
       status: 'active',
       source,
       createdAt: now,
       updatedAt: now,
     });
+    // Never over an owner a concurrent caller has already set on this tenant.
+    await redis.hsetnx(tenantKey(id), 'owner', owner || '');
     await redis.sadd(TENANTS_INDEX_KEY, id);
 
     if (seedDefaults) {
