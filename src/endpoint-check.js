@@ -372,6 +372,15 @@ async function run() {
       const after = await request('GET', `${GATEWAY}/me`, { token: other });
       return after.status === 401 ? res : { status: 500, body: { error: `the other session still answers ${after.status}` } };
     }, [200]);
+  await probe('POST /auth/unlock', 'asking for a sign-in code answers the same for any name',
+    async () => {
+      const real = await request('POST', `${GATEWAY}/auth/unlock`, { body: { username: S.memberUser } });
+      const ghost = await request('POST', `${GATEWAY}/auth/unlock`, { body: { username: `epc_ghost_${randomUUID().slice(0, 8)}` } });
+      if (real.status !== ghost.status || JSON.stringify(real.body) !== JSON.stringify(ghost.body)) {
+        return { status: 500, body: { error: 'the answer differs between a real and an unknown account' } };
+      }
+      return real;
+    }, [202]);
   await probe('POST /auth/password-recovery', 'asking for recovery answers the same for any name',
     async () => {
       const real = await request('POST', `${GATEWAY}/auth/password-recovery`, { body: { username: S.memberUser } });
@@ -461,6 +470,14 @@ async function run() {
       if (again.status !== 400) return { status: 500, body: { error: `the same link worked twice (${again.status})` } };
       const login = await request('POST', `${GATEWAY}/auth/login`, { body: { username: S.recovering.username, password: 'recovered-pass-1' } });
       return login.status === 200 ? first : login;
+    }, [200]);
+  await probe('POST /admin/users/:username/unlock-code', 'admin issues a one-time sign-in code for a locked-out account',
+    async () => {
+      const res = await request('POST', `${GATEWAY}/admin/users/${S.recovering.username}/unlock-code`, { token: S.adminToken });
+      if (res.status === 200 && !/^[A-Z2-9]{5}-[A-Z2-9]{5}$/.test(res.body.code || '')) {
+        return { status: 500, body: { error: `unexpected code format: ${res.body.code}` } };
+      }
+      return res;
     }, [200]);
   await probe('PUT /admin/users/:username/attributes', 'admin sets the attributes conditions are evaluated against',
     () => request('PUT', `${GATEWAY}/admin/users/${S.recovering.username}/attributes`, {

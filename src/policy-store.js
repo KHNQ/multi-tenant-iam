@@ -339,7 +339,19 @@ function createPolicyStore(redis) {
     if (changed && version === store.loadedVersion + 1) store.loadedVersion = version;
   }
 
+  // For a script elsewhere that writes a policy row together with other data
+  // in one step (an approved access request and its role grant, say): it uses
+  // the same keys and Lua helpers, and reports its change here afterwards.
+  store.noteOwnChange = noteOwnChange;
+
   return store;
 }
 
-module.exports = { createPolicyStore, POLICY_KEY, VERSION_KEY };
+/**
+ * The pieces a script outside this module needs to change the policy the way
+ * these scripts do: the four keys (in KEYS[1..4] order), the row encoding, and
+ * the Lua helpers for "is this row there" and "move the version".
+ */
+const LUA = { ROW_EXISTS, BUMP, CURRENT_VERSION };
+
+module.exports = { createPolicyStore, POLICY_KEY, VERSION_KEY, POLICY_KEYS: KEYS, encodeRow, LUA };

@@ -121,10 +121,13 @@ function redirectUriProblem(value) {
  * @param {Function} deps.replaceTemporaryPassword (username, newPassword, { userId, securityVersion }) ->
  *   Promise<{ securityVersion } | { problem }>
  * @param {Function} deps.passwordProblem   (password) -> string|null
+ * @param {Function} [deps.requestUnlockCode] (username, ip) -> Promise<void> — sends the account's
+ *   owner a one-time sign-in code, for a client that is locked out; says nothing either way
  */
 function createOidcProvider({
   redis, log, issuer, secret,
   checkCredentials, issueAccessToken, revokeAccessToken, replaceTemporaryPassword, passwordProblem,
+  requestUnlockCode = async () => {},
 }) {
   const derive = (purpose) => Buffer.from(crypto.hkdfSync('sha256', secret, 'iam-gateway', purpose, 32));
   const storageKey = derive('oidc-signing-key-at-rest');
@@ -285,18 +288,33 @@ ${body}
 
   // `request` is the validated authorization request; `blob` is the same
   // thing signed, which the form carries back.
-  function loginPage(res, status, { request, blob, client }, message = '') {
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.unlock] the client is locked out: offer to send a
+   *   sign-in code, and take one with the password
+   * @param {string} [opts.username] to fill the form in again with
+   * @param {boolean} [opts.notice] the message is information, not an error
+   */
+  function loginPage(res, status, { request, blob, client }, message = '', { unlock = false, username = '', notice = false } = {}) {
     sendPage(res, status, 'Sign in', `
   <h2>Sign in</h2>
   <p class="muted">to continue to <strong>${escapeHtml(client.name)}</strong></p>
-  ${message ? `<p class="banner err" role="alert">${escapeHtml(message)}</p>` : ''}
+  ${message ? `<p class="banner ${notice ? 'ok' : 'err'}" role="alert">${escapeHtml(message)}</p>` : ''}
   <form method="post" action="/oauth/authorize">
     <input type="hidden" name="request" value="${escapeHtml(blob)}">
     <input type="hidden" name="step" value="login">
-    <input name="username" placeholder="username" autocomplete="username" required autofocus>
-    <input name="password" placeholder="password" type="password" autocomplete="current-password" required>
+    <input name="username" placeholder="username" autocomplete="username" value="${escapeHtml(username)}" required ${username ? '' : 'autofocus'}>
+    <input name="password" placeholder="password" type="password" autocomplete="current-password" required ${username ? 'autofocus' : ''}>
+    ${unlock ? '<input name="unlock_code" placeholder="sign-in code (XXXXX-XXXXX)" autocomplete="one-time-code">' : ''}
     <button type="submit">Sign in</button>
   </form>
+  ${unlock ? `
+  <form method="post" action="/oauth/authorize">
+    <input type="hidden" name="request" value="${escapeHtml(blob)}">
+    <input type="hidden" name="step" value="unlock-request">
+    <input type="hidden" name="username" value="${escapeHtml(username)}">
+    <button type="submit" class="ghost">Send me a sign-in code</button>
+  </form>` : ''}
   <p class="muted"><a href="${escapeHtml(issuer)}/console#forgot">Forgot your password?</a></p>`,
     { formActions: [new URL(request.redirectUri).origin] });
   }
@@ -415,14 +433,33 @@ ${body}
       return issueCode(res, request, continuation.userId, replaced.securityVersion);
     }
 
+    if (form.step === 'unlock-request') {
+      // "Send me a sign-in code". The same answer whether or not the account
+      // exists, given at once; the code goes to the owner, not to this page.
+      const username = typeof form.username === 'string' ? form.username.trim().slice(0, 128) : '';
+      if (username) {
+        requestUnlockCode(username, req.ip).catch((err) => log.error('oidc', `Sign-in code request failed: ${err.message}`));
+      }
+      return loginPage(res, 200, { request, blob: form.request, client },
+        'If that account exists, a one-time sign-in code has been sent to its owner. Enter it below with your password.',
+        { unlock: true, username, notice: true });
+    }
+
     if (typeof form.username !== 'string' || typeof form.password !== 'string'
         || !form.username.trim() || form.username.length > 128 || form.password.length > 1024) {
       return loginPage(res, 400, { request, blob: form.request, client }, 'Enter your username and password.');
     }
-    const { account, deviceToken, refusal } = await checkCredentials(form.username.trim(), form.password, req.ip, {
-      deviceToken: readCookie(req, DEVICE_COOKIE),
+    const username = form.username.trim();
+    const unlockCode = typeof form.unlock_code === 'string' && form.unlock_code.trim() ? form.unlock_code.slice(0, 32) : undefined;
+    const { account, deviceToken, refusal } = await checkCredentials(username, form.password, req.ip, {
+      deviceToken: readCookie(req, DEVICE_COOKIE), unlockCode,
     });
-    if (refusal) return loginPage(res, refusal.status, { request, blob: form.request, client }, refusal.error);
+    if (refusal) {
+      // Locked out on this client: offer the way past it, with the name kept.
+      const locked = refusal.code === 'SIGN_IN_LOCKED';
+      return loginPage(res, refusal.status, { request, blob: form.request, client }, refusal.error,
+        { unlock: locked || Boolean(unlockCode), username: locked || unlockCode ? username : '' });
+    }
 
     res.cookie(DEVICE_COOKIE, deviceToken, {
       httpOnly: true,
@@ -557,6 +594,26 @@ ${body}
   const jwks = () => ({ keys: [{ ...signing.jwk, alg: 'RS256', use: 'sig', kid: signing.kid }] });
 
   /**
+   * A gateway assertion for one downstream service: who is calling, signed
+   * with the key published at /oauth/jwks, addressed to that service alone
+   * (aud "service:<name>"), and short-lived. What a service is given instead
+   * of the caller's own token.
+   */
+  function signServiceAssertion({ subject, username, service, ttlSeconds = 60 }) {
+    const now = Math.floor(Date.now() / 1000);
+    return jwt.sign({
+      iss: issuer,
+      sub: subject,
+      aud: `service:${service}`,
+      iat: now,
+      exp: now + ttlSeconds,
+      jti: randomToken(12),
+      token_use: 'gateway-assertion',
+      preferred_username: username,
+    }, signing.privateKey, { algorithm: 'RS256', keyid: signing.kid });
+  }
+
+  /**
    * CORS for the endpoints a browser-based client calls directly. Only the
    * origins of registered redirect URIs are answered; credentials are never
    * allowed, because nothing here is authenticated by a cookie.
@@ -580,6 +637,7 @@ ${body}
     init, authorize, authorizeSubmit, token, cors,
     discoveryDocument, jwks,
     getClient, listClients, createClient, deleteClient,
+    signServiceAssertion,
     CONSOLE_CLIENT_ID,
   };
 }

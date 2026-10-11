@@ -1,16 +1,15 @@
 /**
- * End-to-End Test Suite for IAM API Gateway
- * Requires Node.js v18+ (for native fetch)
- * * INSTRUCTIONS:
- * 1. Ensure your API Gateway (src/main.js) is currently RUNNING in another terminal.
- * 2. Run this test suite using the native Node test runner:
- * node --test tests/e2e.test.js
+ * Smoke test for the IAM API Gateway: login, role grant, proxied access, and a
+ * service onboarded on the fly. A node:test script against a RUNNING stack —
+ * not a Jest suite (Jest runs the unit tests in test/unit, see package.json).
+ *
+ * Run (with the stack up):  ADMIN_PASSWORD=<platform admin password> npm run test:smoke
  */
 
 const test = require('node:test');
 const assert = require('node:assert');
 
-const BASE_URL = 'http://localhost:3000';
+const BASE_URL = (process.env.GATEWAY_URL || 'http://localhost:3000').replace(/\/+$/, '');
 
 // --- HELPER FUNCTIONS ---
 async function postJSON(endpoint, payload, token = null) {
@@ -39,6 +38,8 @@ test('IAM API Gateway - Full Scenario Coverage', async (t) => {
   let adminToken;
   let userToken;
   const testUser = `user_${Date.now()}`; // Unique user for this run
+  // A service registered by this run, so a second run does not collide with it.
+  const serviceName = `analytics${Date.now() % 1000000}`;
 
   await t.test('1. Admin Login', async () => {
     // There is no built-in admin password: say which platform admin to run as.
@@ -117,21 +118,20 @@ test('IAM API Gateway - Full Scenario Coverage', async (t) => {
   await t.test(
     '7. Admin registers a completely NEW service dynamically',
     async () => {
-      const { status, data } = await postJSON(
-        '/admin/services',
+      // A platform admin creates the tenant and registers its service in one call.
+      const { status } = await postJSON(
+        '/admin/tenants',
         {
-          name: 'analytics',
+          id: serviceName,
           baseUrl: 'http://localhost:8080', // Re-using LLM machine port to simulate active host
-          version: 'v1',
-          owner: 'data_team',
-          status: 'active',
+          endpoints: [`/${serviceName}/metrics`],
         },
         adminToken,
       );
       assert.strictEqual(
         status,
-        200,
-        'Admin should successfully register new service into Redis',
+        201,
+        'Admin should successfully register the new service',
       );
     },
   );
@@ -143,7 +143,7 @@ test('IAM API Gateway - Full Scenario Coverage', async (t) => {
         '/admin/policies',
         {
           subject: `user:${testUser}`, // Granting directly to the user — a bare name is always a role
-          resource: '/analytics/metrics',
+          resource: `/${serviceName}/metrics`,
           action: 'get',
         },
         adminToken,
@@ -160,7 +160,7 @@ test('IAM API Gateway - Full Scenario Coverage', async (t) => {
     '9. User accesses the newly registered and permitted service',
     async () => {
       // Test the newly mapped dynamic proxy
-      const { status } = await getAuth('/gateway/analytics/metrics', userToken);
+      const { status } = await getAuth(`/gateway/${serviceName}/metrics`, userToken);
 
       // As long as the status is NOT 403, it means Casbin authorized it and the API Gateway successfully attempted to proxy it.
       // (It might be 404 because the mock machine on 8080 doesn't actually have a /analytics/metrics route, but the Gateway did its job!)
@@ -171,4 +171,10 @@ test('IAM API Gateway - Full Scenario Coverage', async (t) => {
       );
     },
   );
+
+  await t.test('10. Clean up', async () => {
+    const remove = (path) => fetch(`${BASE_URL}${path}`, { method: 'DELETE', headers: { Authorization: `Bearer ${adminToken}` } });
+    assert.strictEqual((await remove(`/admin/tenants/${serviceName}?deregister=true`)).status, 200, 'remove the service');
+    assert.strictEqual((await remove(`/admin/users/${testUser}`)).status, 200, 'remove the user');
+  });
 });

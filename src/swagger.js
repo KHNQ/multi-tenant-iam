@@ -74,6 +74,10 @@ const spec = {
             type: 'string',
             description: 'Login only, optional: the `deviceToken` an earlier successful login from this client returned.',
           },
+          unlockCode: {
+            type: 'string',
+            description: 'Login only, optional: a one-time sign-in code (`POST /auth/unlock`), for a client that is locked out.',
+          },
         },
       },
       LoginResponse: {
@@ -312,11 +316,34 @@ const spec = {
             description: 'The password was correct but the account is suspended (`code: "ACCOUNT_SUSPENDED"`)',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
+          409: {
+            description: 'The account changed (password, suspension, sessions ended) while the password was being checked — `code: "ACCOUNT_CHANGED"`; sign in again',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+          },
           429: {
-            description: 'Too many attempts — from this address, for this username from this address, or for this username from clients it does not recognise; see `Retry-After`',
+            description: 'Too many attempts. `code: "SIGN_IN_LOCKED"` means failed attempts made against this username (from this address, or from many) have locked out clients it does not recognise: ask for a sign-in code (`POST /auth/unlock`) and send it as `unlockCode`. Otherwise `RATE_LIMITED`; see `Retry-After`',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
         },
+      },
+    },
+
+    '/auth/unlock': {
+      post: {
+        tags: ['Auth'],
+        summary: 'Ask for a one-time sign-in code (locked out on this device)',
+        description:
+          'For an owner refused with `SIGN_IN_LOCKED` on a client the account does not recognise — ' +
+          'a new device, or one behind the same NAT as whoever is guessing. Always answers 202 at ' +
+          'once, whether or not the account exists; for a real, active account a code ' +
+          '(`XXXXX-XXXXX`) goes to the configured notification service (event `sign-in-code`). ' +
+          'With the password, the code gets past the lockout: 5 attempts, 15 minutes, single use. ' +
+          'It is not a password and signs nobody in by itself.',
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: { type: 'object', required: ['username'], properties: { username: { type: 'string' } } } } },
+        },
+        responses: { 202: { description: 'Accepted — says nothing about whether the account exists' } },
       },
     },
 
@@ -807,6 +834,24 @@ const spec = {
       },
     },
 
+    '/admin/users/{username}/unlock-code': {
+      post: {
+        tags: ['Admin'],
+        summary: 'Issue a one-time sign-in code for a locked-out account',
+        description:
+          'For handing to the account\'s owner when no notification channel is configured. With ' +
+          'their password, it gets them past a lockout on a client the account does not recognise. ' +
+          'Returned in this response only.',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'username', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          200: { description: '`code` (XXXXX-XXXXX) and `expiresAt`' },
+          403: { description: 'Admin privileges required' },
+          404: { description: 'User not found' },
+        },
+      },
+    },
+
     '/admin/users/{username}/recovery-link': {
       post: {
         tags: ['Admin'],
@@ -1212,8 +1257,10 @@ const spec = {
           'the whole platform and a service needs none of that to answer one call. The service is ' +
           'told who is calling instead — `X-Gateway-User-Id` (the account\'s immutable id) and ' +
           '`X-Gateway-User` (its username, URI-encoded). Both are set by the gateway on every ' +
-          'request, overwriting anything the caller sent. A service receives the original token ' +
-          'only if the platform operator has listed it in `FORWARD_AUTHORIZATION_TO`.\n\n' +
+          'request, overwriting anything the caller sent. Its own credential is ' +
+          '`X-Gateway-Assertion`: a 60-second RS256 JWT signed by the gateway (keys at ' +
+          '`/oauth/jwks`) with `aud: service:<name>` and `sub` = the caller\'s account id — useless ' +
+          'at any other service and at the gateway. No service ever receives the caller\'s token.\n\n' +
           '**Where it may be sent.** Only to an address inside `UPSTREAM_ALLOWED_CIDRS`. The ' +
           'service\'s hostname is resolved by the gateway, every resolved address is checked, and ' +
           'the connection is made to that address — a name that starts resolving somewhere else ' +

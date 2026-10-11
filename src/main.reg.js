@@ -14,17 +14,21 @@ const { spec } = require('./swagger');
 const { createLogger } = require('./logger');
 const {
   createTenancy, validateTenantId, validateRoleName, ownsResource, TENANT_PERMISSIONS,
-  userSubject, parseUserSubject, platformRoleSubject, parsePlatformRole, parseQualifiedRole,
+  userSubject, parseUserSubject, platformRoleSubject, parsePlatformRole, parseQualifiedRole, qualifyRole, tenantKeys,
 } = require('./tenancy');
 const { createDestinationGuardFromEnv, DESTINATION_NOT_ALLOWED } = require('./netguard');
 const { createRateLimiter } = require('./ratelimit');
-const { createPolicyStore, POLICY_KEY: CASBIN_POLICY_KEY, VERSION_KEY: POLICY_VERSION_KEY } = require('./policy-store');
+const {
+  createPolicyStore, POLICY_KEY: CASBIN_POLICY_KEY, VERSION_KEY: POLICY_VERSION_KEY, POLICY_KEYS, encodeRow, LUA: POLICY_LUA,
+} = require('./policy-store');
 const { rebuildTarget, upstreamRequestTarget, resendConsumedBody } = require('./proxy-request');
 const { evaluateCondition } = require('./abac');
 const { createMetrics, CONTENT_TYPE: METRICS_CONTENT_TYPE } = require('./metrics');
 const { createOidcProvider, redirectUriProblem, oidcClientKey, CONSOLE_CLIENT_ID } = require('./oidc');
 const { parseTrustProxy, clientKey } = require('./client-address');
 const { createDeviceTrust } = require('./device-trust');
+const { writePrivateFile } = require('./private-file');
+const { createAccessTokens } = require('./access-token');
 const { v, validate, bodyParseErrors, JSON_BODY_LIMIT } = require('./validation');
 
 const log = createLogger('gateway');
@@ -235,6 +239,15 @@ const LOGIN_ACCOUNT_LIMIT = {
   windowSeconds: 15 * 60,
 };
 const LOGIN_DEVICE_LIMIT = { max: 10, windowSeconds: 15 * 60 };
+// The way past a lockout for a client the account does not recognise — a new
+// device, or one behind the same NAT as whoever is guessing: a one-time
+// sign-in code sent to the account's own notification channel (or handed over
+// by an admin). Asking for one is limited per address and per account; each
+// code allows a few attempts and expires.
+const UNLOCK_REQUEST_SOURCE_LIMIT = { max: 3, windowSeconds: 60 * 60 };
+const UNLOCK_REQUEST_ACCOUNT_LIMIT = { max: 10, windowSeconds: 60 * 60 };
+const UNLOCK_CODE_TTL_SECONDS = 15 * 60;
+const UNLOCK_CODE_ATTEMPTS = 5;
 // Wrong `currentPassword` on change-password: a stolen token must not turn
 // that route into an unthrottled password oracle.
 const PASSWORD_CHECK_LIMIT = { max: 5, windowSeconds: 15 * 60 }; // per account
@@ -266,11 +279,12 @@ const SIGNUP_IP_LIMIT = perMinute('SIGNUP_MAX_PER_MINUTE', 300);
 const API_REQUEST_LIMIT = { bucket: 'api', ...perMinute('API_REQUESTS_PER_MINUTE', 1200) };
 const GATEWAY_REQUEST_LIMIT = { bucket: 'gateway', ...perMinute('GATEWAY_REQUESTS_PER_MINUTE', 1200) };
 
-// Services that receive the caller's own bearer token. Empty by default: see
-// the proxy route for why a token is not something to hand downstream.
-const FORWARD_AUTHORIZATION_TO = new Set(
-  (process.env.FORWARD_AUTHORIZATION_TO || '').split(',').map((name) => name.trim()).filter(Boolean),
-);
+// No service receives the caller's own bearer token any more: each gets a
+// credential of its own (X-Gateway-Assertion, see the proxy route). The old
+// switch that forwarded the token is gone; say so if it is still configured.
+if (process.env.FORWARD_AUTHORIZATION_TO) {
+  console.warn('[Gateway] FORWARD_AUTHORIZATION_TO is no longer supported and is ignored: services receive a signed X-Gateway-Assertion, never the caller\'s token.');
+}
 
 // Index Sets so we can enumerate users/roles without SCANning user:* hashes
 const USERS_INDEX_KEY = 'users:index';
@@ -691,6 +705,12 @@ async function deleteUser(username) {
     if (cancelled) log.audit('request', `Cancelled ${cancelled} pending request(s) of deleted account '${username}'`, { username, cancelled });
     const recovery = await redis.get(recoveryAccountKey(id));
     if (recovery) await redis.del(recoveryTokenKey(recovery), recoveryAccountKey(id));
+    let cursor = '0';
+    do {
+      const [next, keys] = await redis.scan(cursor, 'MATCH', `unlock:${id}:*`, 'COUNT', 100);
+      if (keys.length) await redis.del(...keys);
+      cursor = next;
+    } while (cursor !== '0');
   }
 }
 
@@ -1034,6 +1054,126 @@ async function requesterOf(request) {
   return { id: requesterId, username };
 }
 
+// Approving a request and writing what it grants, as ONE step.
+//
+// Done as "mark it approved, then grant the role to <username>", two things
+// could go wrong between the steps: the grant could fail and leave a request
+// approved that granted nothing, and — because the grant looked the account up
+// again by username — an account deleted and its name signed up for again in
+// between would receive the role meant for the one that asked. This script
+// takes the requester's immutable id and the username it resolved to, and in
+// the same atomic step: checks the request is still pending and is that
+// account's, checks the id still names that username and the username that id,
+// checks the role (and tenant) still exist, then marks the request approved,
+// adds the grant row (moving the policy version, as policy-store.js does) and
+// writes the memberships. Either all of it happens or none of it.
+//
+// KEYS: 1-4 the policy store's (list, version, conditions, changed-at),
+//       5 request, 6 users:ids, 7 user:{username}, 8 the role registry
+//       (tenant roles / platform roles index), 9 the tenant record,
+//       10 the tenant's members, 11 the user's tenants.
+// ARGV: mode ('tenant'|'platform'), requesterId, username, role, grant row,
+//       resolvedBy, resolvedAt, tenantId.
+// -> { 1, added, version } | { 0, reason }
+redis.defineCommand('commitApproval', {
+  numberOfKeys: 11,
+  lua: `
+    ${POLICY_LUA.ROW_EXISTS}
+    ${POLICY_LUA.BUMP}
+    if redis.call('HGET', KEYS[5], 'status') ~= 'pending' then return { 0, 'decided' } end
+    if redis.call('HGET', KEYS[5], 'requesterId') ~= ARGV[2] then return { 0, 'not-this-requester' } end
+    if redis.call('HGET', KEYS[6], ARGV[2]) ~= ARGV[3] or redis.call('HGET', KEYS[7], 'id') ~= ARGV[2] then
+      redis.call('HSET', KEYS[5], 'status', 'cancelled', 'resolvedAt', ARGV[7], 'resolvedBy', 'system',
+        'grantedRole', '', 'reason', 'account-deleted')
+      return { 0, 'requester-gone' }
+    end
+    if ARGV[1] == 'tenant' and redis.call('EXISTS', KEYS[9]) == 0 then return { 0, 'tenant-gone' } end
+    if redis.call('SISMEMBER', KEYS[8], ARGV[4]) == 0 then return { 0, 'role-gone' } end
+
+    redis.call('HSET', KEYS[5], 'status', 'approved', 'resolvedAt', ARGV[7], 'resolvedBy', ARGV[6],
+      'grantedRole', ARGV[4], 'reason', '')
+    local added = 0
+    local version = ${POLICY_LUA.CURRENT_VERSION}
+    if not row_exists(KEYS[1], ARGV[5]) then
+      redis.call('RPUSH', KEYS[1], ARGV[5])
+      added = 1
+      version = bump()
+    end
+    if ARGV[1] == 'tenant' then
+      redis.call('SADD', KEYS[10], ARGV[3])
+      redis.call('SADD', KEYS[11], ARGV[8])
+    else
+      -- The platform role the account is shown with, unless it is an admin.
+      local shown = redis.call('HGET', KEYS[7], 'role')
+      if shown ~= 'admin' or ARGV[4] == 'admin' then redis.call('HSET', KEYS[7], 'role', ARGV[4]) end
+    end
+    return { 1, added, version }
+  `,
+});
+
+/**
+ * Approves `request` for `requester` (its immutable id and the username that
+ * id named when it was looked up) and grants `role` — platform-wide, or in
+ * `tenantId` — in one atomic step.
+ * @returns {Promise<{ ok: true, request: object } | { ok: false, reason: string }>}
+ */
+async function commitApproval({ request, requester, role, tenantId = null, actor }) {
+  const grantedTo = tenantId ? qualifyRole(tenantId, role) : platformRoleSubject(role);
+  const placeholder = ROLES_INDEX_KEY; // for keys a platform approval does not touch
+  const [ok, addedOrReason, version] = await redis.commitApproval(
+    ...POLICY_KEYS,
+    requestKey(request.id),
+    USER_IDS_KEY,
+    `user:${requester.username}`,
+    tenantId ? tenantKeys.roles(tenantId) : ROLES_INDEX_KEY,
+    tenantId ? tenantKeys.tenant(tenantId) : placeholder,
+    tenantId ? tenantKeys.members(tenantId) : placeholder,
+    tenantId ? tenantKeys.userTenants(requester.username) : placeholder,
+    tenantId ? 'tenant' : 'platform',
+    requester.id,
+    requester.username,
+    role,
+    encodeRow('g', [userSubject(requester.id), grantedTo]),
+    actor,
+    new Date().toISOString(),
+    tenantId || '',
+  );
+  if (ok !== 1) return { ok: false, reason: addedOrReason };
+
+  // The row is in Redis; bring this instance's copy of the policy up to date.
+  // If nothing else changed meanwhile, add it in memory (with the adapter
+  // switched off — it is already stored); otherwise reload.
+  if (addedOrReason === 1) {
+    if (version === policyStore.loadedVersion + 1) {
+      await withCasbin(async () => {
+        enforcer.enableAutoSave(false);
+        try { await enforcer.addGroupingPolicy(userSubject(requester.id), grantedTo); } finally { enforcer.enableAutoSave(true); }
+      });
+      policyStore.noteOwnChange(1, version);
+    } else {
+      await followPolicyVersion(version);
+    }
+  }
+  return { ok: true, request: await getAccessRequest(request.id) };
+}
+
+/** What a failed commit means for the caller. */
+async function answerFailedApproval(res, outcome, { request, role, tenantId, actor }) {
+  switch (outcome.reason) {
+    case 'requester-gone':
+      log.audit('request', `Request ${request.id} closed: the account that made it no longer exists`, {
+        actor, requestId: request.id, requestedBy: request.username,
+      });
+      return res.status(410).json({ error: 'The account that made this request no longer exists; the request has been closed' });
+    case 'role-gone':
+      return res.status(404).json({ error: tenantId ? `Role '${role}' does not exist in tenant '${tenantId}'` : `Role '${role}' does not exist` });
+    case 'tenant-gone':
+      return res.status(404).json({ error: `Tenant '${tenantId}' no longer exists` });
+    default:
+      return res.status(409).json({ error: `Request already ${(await getAccessRequest(request.id))?.status || 'closed'}` });
+  }
+}
+
 /**
  * Answers an approval whose requester can no longer receive anything: the
  * request is closed (if it is still open) and the caller told why.
@@ -1179,11 +1319,27 @@ async function revokeJti(jti, ttlSeconds) {
 // disable the limiter. The counting itself is atomic — see ratelimit.js.
 // Device tokens (device-trust.js), signed with a key derived from JWT_SECRET.
 const deviceTrust = createDeviceTrust(JWT_SECRET);
+
+// HSET only if the field still holds what the caller last read.
+redis.defineCommand('hsetIfEqual', {
+  numberOfKeys: 1,
+  lua: `
+    if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+    redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+    return 1
+  `,
+});
 const limiter = createRateLimiter(redis, { onLimited: (bucket) => rateLimited.inc({ bucket }) });
 
 /** Answers 429 with the wait the limiter reported. */
 // The code lets a client tell "slow down" apart from every other refusal.
 const RATE_LIMITED = 'RATE_LIMITED';
+// A sign-in refused because of failed attempts made against the username by
+// someone else, from this client's address or from clients it shares nothing
+// with. The way past it is a one-time sign-in code (POST /auth/unlock).
+const SIGN_IN_LOCKED = 'SIGN_IN_LOCKED';
+// The account's security changed while the password was being checked.
+const ACCOUNT_CHANGED = 'ACCOUNT_CHANGED';
 
 function tooManyRequests(res, slot, message) {
   res.set('Retry-After', String(slot.retryAfterSeconds));
@@ -1218,6 +1374,15 @@ const requestIdParam = { id: v.requestId };
  * anything a token asserts about its holder is something a later request
  * might believe instead of checking.
  */
+// Session (access) tokens: HS256, for THIS gateway only — issuer, audience,
+// mandatory expiry and token type are all checked (access-token.js).
+const accessTokens = createAccessTokens({
+  secret: JWT_SECRET,
+  issuer: PUBLIC_URL,
+  audience: 'iam-gateway',
+  ttlSeconds: 24 * 60 * 60,
+});
+
 /**
  * @param {object} claims
  * @param {string} claims.id            the account id (`sub`)
@@ -1225,12 +1390,7 @@ const requestIdParam = { id: v.requestId };
  * @param {string} [claims.clientId]    the OIDC client the session was issued to
  *   (`cid`); a session that carries one ends when that client is deleted
  */
-function signToken({ id, tokenVersion, clientId }) {
-  const jti = crypto.randomUUID();
-  return jwt.sign({ sub: id, tokenVersion, jti, ...(clientId ? { cid: clientId } : {}) }, JWT_SECRET, {
-    algorithm: JWT_ALGORITHM, expiresIn: '24h',
-  });
-}
+const signToken = (claims) => accessTokens.sign(claims);
 
 app.post('/auth/signup', validate({
   body: { username: v.newUsername, password: v.newPassword },
@@ -1282,16 +1442,28 @@ const dummyPasswordHash = hashPassword(crypto.randomBytes(24).toString('hex'));
  * owner's. Every slot is taken before the password is verified, so parallel
  * guesses are bounded too.
  *
+ * A client that is locked out that way can still get in with a one-time
+ * sign-in code (requestUnlockCode): only the account's owner receives one, and
+ * an attempt that carries a valid code is charged to the code, not to the
+ * counters an attacker has filled.
+ *
+ * Everything about the account is read ONCE, in one HGETALL — the password
+ * hash, the id, the status and the security version together — and that one
+ * snapshot is what the caller gets back. A token made from it carries the
+ * security version the password was verified against, never one read later:
+ * otherwise an attempt that started before a password change, with the old
+ * password, could finish after it holding a token at the NEW version.
+ *
  * @param {string} username
  * @param {string} password
  * @param {string} ip the client's address (req.ip)
- * @param {{ deviceToken?: string }} [opts]
+ * @param {{ deviceToken?: string, unlockCode?: string }} [opts]
  * @returns {Promise<{ account: object, deviceToken: string } | { refusal: { status: number, error: string, code?: string, retryAfterSeconds?: number } }>}
  */
-async function checkCredentials(username, password, ip, { deviceToken } = {}) {
+async function checkCredentials(username, password, ip, { deviceToken, unlockCode } = {}) {
   const source = clientKey(ip);
-  const tooMany = (slot, error) => ({
-    refusal: { status: 429, error, code: RATE_LIMITED, retryAfterSeconds: slot.retryAfterSeconds },
+  const tooMany = (slot, error, code = RATE_LIMITED) => ({
+    refusal: { status: 429, error, code, retryAfterSeconds: slot.retryAfterSeconds },
   });
 
   const ipSlot = await limiter.take('login:ip', source, LOGIN_IP_LIMIT);
@@ -1303,24 +1475,30 @@ async function checkCredentials(username, password, ip, { deviceToken } = {}) {
   const userData = await getUser(username);
   const device = deviceTrust.read(deviceToken);
   const recognised = Boolean(device && userData?.id && device.userId === userData.id);
+  // A sign-in code is checked (and an attempt spent from it) only for a real
+  // account; for anything else it is ignored, so it says nothing either way.
+  const unlock = !recognised && unlockCode && userData?.id ? await takeUnlockAttempt(userData.id, unlockCode) : null;
 
-  // [bucket, key, limit, what the caller is told]
+  const lockedOut = 'Too many failed sign-in attempts for this username from this client. If this is your account, '
+    + 'ask for a one-time sign-in code (POST /auth/unlock, or "Send me a sign-in code" on the sign-in page) and sign in with it — '
+    + 'or sign in from a device you have used before';
+  // [bucket, key, limit, what the caller is told, code]
   const slots = recognised
     ? [['login:device', `${username}:${device.deviceId}`, LOGIN_DEVICE_LIMIT,
-      'Too many failed login attempts from this device, try again later']]
-    : [['login:source', `${username}|${source}`, LOGIN_SOURCE_LIMIT,
-      'Too many failed login attempts for this username from this address, try again later'],
-    ['login:account', username, LOGIN_ACCOUNT_LIMIT,
-      'Too many failed login attempts for this username, try again later — or sign in from a device you have used before']];
+      'Too many failed login attempts from this device, try again later', RATE_LIMITED]]
+    : unlock
+      ? [] // charged to the code, which allows UNLOCK_CODE_ATTEMPTS and then is gone
+      : [['login:source', `${username}|${source}`, LOGIN_SOURCE_LIMIT, lockedOut, SIGN_IN_LOCKED],
+        ['login:account', username, LOGIN_ACCOUNT_LIMIT, lockedOut, SIGN_IN_LOCKED]];
 
   const taken = [];
-  for (const [bucket, key, limit, error] of slots) {
+  for (const [bucket, key, limit, error, code] of slots) {
     const slot = await limiter.take(bucket, key, limit);
     if (!slot.allowed) {
       // This attempt is not happening; it should not count against the others.
       await Promise.all(taken.map(([b, k]) => limiter.refund(b, k)));
       log.warn('auth', `Login blocked: too many attempts (${bucket})`, { username, ip, count: slot.count, recognisedDevice: recognised });
-      return tooMany(slot, error);
+      return tooMany(slot, error, code);
     }
     taken.push([bucket, key]);
   }
@@ -1331,19 +1509,25 @@ async function checkCredentials(username, password, ip, { deviceToken } = {}) {
   if (!known || !valid) {
     // The reason is for the audit log only; the caller gets one answer.
     authEvents.inc({ event: 'login_failed' });
-    log.audit('auth', 'Login failed', { username, ip, reason: known ? 'bad-password' : 'unknown-user', recognisedDevice: recognised });
+    log.audit('auth', 'Login failed', {
+      username, ip, reason: known ? 'bad-password' : 'unknown-user', recognisedDevice: recognised, withUnlockCode: Boolean(unlock),
+    });
     return { refusal: { status: 401, error: LOGIN_FAILED } };
   }
 
   // The password was right. This source's (or device's) count starts again;
   // the account-wide count only gets this attempt back — clearing it would
-  // hand whoever is spraying guesses a fresh allowance.
+  // hand whoever is spraying guesses a fresh allowance. A sign-in code is
+  // used up.
   await Promise.all([
     limiter.refund('login:ip', source),
     ...(recognised
       ? [limiter.reset('login:device', `${username}:${device.deviceId}`)]
-      : [limiter.reset('login:source', `${username}|${source}`), limiter.refund('login:account', username)]),
+      : unlock
+        ? [limiter.reset('login:source', `${username}|${source}`), redis.del(unlock.key)]
+        : [limiter.reset('login:source', `${username}|${source}`), limiter.refund('login:account', username)]),
   ]);
+  if (unlock) log.audit('auth', `User '${username}' signed in past a lockout with a one-time sign-in code`, { username, ip });
 
   // Said only to someone who has just proved they hold the password.
   if (userData.status === ACCOUNT_STATUS.suspended) {
@@ -1353,9 +1537,12 @@ async function checkCredentials(username, password, ip, { deviceToken } = {}) {
 
   if (rehash) {
     // Legacy bcrypt hash just verified successfully — migrate it to Argon2
-    // transparently now that we have the plaintext in hand.
-    await redis.hset(`user:${username}`, 'password', rehash);
-    log.info('auth', `Password hash migrated from bcrypt to Argon2`, { username });
+    // transparently now that we have the plaintext in hand. Only over the
+    // hash that was verified: if the password was changed while this one was
+    // being checked, the new one stays.
+    if (await redis.hsetIfEqual(`user:${username}`, 'password', userData.password, rehash) === 1) {
+      log.info('auth', `Password hash migrated from bcrypt to Argon2`, { username });
+    }
   }
 
   authEvents.inc({ event: 'login_succeeded' });
@@ -1381,18 +1568,29 @@ app.post('/auth/login', validate({
     password: v.presentedPassword,
     // The deviceToken a previous successful login returned, if this client kept it.
     deviceToken: v.optional(v.string({ max: 600 })),
+    // A one-time sign-in code (POST /auth/unlock), for a client that is locked out.
+    unlockCode: v.optional(v.string({ max: 32 })),
   },
 }), async (req, res) => {
   const { account, deviceToken, refusal } = await checkCredentials(req.body.username, req.body.password, req.ip, {
-    deviceToken: req.body.deviceToken,
+    deviceToken: req.body.deviceToken, unlockCode: req.body.unlockCode,
   });
   if (refusal) {
     if (refusal.retryAfterSeconds) res.set('Retry-After', String(refusal.retryAfterSeconds));
     return res.status(refusal.status).json({ error: refusal.error, ...(refusal.code ? { code: refusal.code } : {}) });
   }
 
-  const tokenVersion = await getTokenVersion(account.username);
-  const token = signToken({ id: account.id, tokenVersion });
+  // The token is made from the snapshot the password was verified against:
+  // that account id, that security version. If the account has changed since
+  // (its password was changed while this attempt was being checked, say),
+  // there is no token to hand out — not one at the new version, which would
+  // let the old password outlive its own replacement.
+  const [currentId, currentVersion] = await redis.hmget(`user:${account.username}`, 'id', 'tokenVersion');
+  if (currentId !== account.id || Number(currentVersion || 0) !== account.securityVersion) {
+    log.audit('auth', `Login for '${account.username}' discarded: the account changed while it was being checked`, { username: account.username, ip: req.ip });
+    return res.status(409).json({ error: 'The account changed while you were signing in — sign in again', code: ACCOUNT_CHANGED });
+  }
+  const token = signToken({ id: account.id, tokenVersion: account.securityVersion });
   const mustChangePassword = account.mustChangePassword === '1';
 
   log.audit('auth', `User '${account.username}' logged in`, { username: account.username, ip: req.ip, mustChangePassword });
@@ -1463,7 +1661,7 @@ function authenticate({ allowPendingPasswordChange = false, budget = API_REQUEST
 
     let payload;
     try {
-      payload = jwt.verify(authHeader.split(' ')[1], JWT_SECRET, { algorithms: [JWT_ALGORITHM] });
+      payload = accessTokens.verify(authHeader.split(' ')[1]);
     } catch {
       authEvents.inc({ event: 'token_invalid' });
       return res.status(403).json({ error: 'Token expired or invalid' });
@@ -1862,11 +2060,15 @@ async function issueRecoveryToken(username) {
   };
 }
 
-/** Hands a recovery link to the operator's notifier. Never throws. */
-async function deliverRecoveryLink(username, recovery) {
+/**
+ * Hands something only the account's owner should see (a recovery link, a
+ * sign-in code) to the operator's notification service, which knows how to
+ * reach them. Never throws; never logs what it carries.
+ */
+async function notifyAccountOwner(username, event, payload, what) {
   if (!RECOVERY_WEBHOOK_URL) {
-    log.audit('auth', `Password recovery requested for '${username}', but no delivery channel is configured`, {
-      username, hint: 'set PASSWORD_RECOVERY_WEBHOOK_URL, or have an admin issue a recovery link',
+    log.audit('auth', `A ${what} was requested for '${username}', but no delivery channel is configured`, {
+      username, event, hint: 'set PASSWORD_RECOVERY_WEBHOOK_URL, or have an admin issue it',
     });
     return;
   }
@@ -1877,21 +2079,111 @@ async function deliverRecoveryLink(username, recovery) {
     const response = await fetch(RECOVERY_WEBHOOK_URL, {
       method: 'POST',
       signal: controller.signal,
-      // It carries a recovery link and the webhook token; it goes to the
-      // configured URL or nowhere.
+      // It carries a secret for the account and the webhook token; it goes to
+      // the configured URL or nowhere.
       redirect: 'error',
       headers: {
         'Content-Type': 'application/json',
         ...(RECOVERY_WEBHOOK_TOKEN ? { Authorization: `Bearer ${RECOVERY_WEBHOOK_TOKEN}` } : {}),
       },
-      body: JSON.stringify({ event: 'password-recovery', username, link: recovery.link, expiresAt: recovery.expiresAt }),
+      body: JSON.stringify({ event, username, ...payload }),
     }).finally(() => clearTimeout(timer));
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    log.audit('auth', `Password recovery link for '${username}' handed to the notification service`, { username });
+    log.audit('auth', `A ${what} for '${username}' was handed to the notification service`, { username, event });
   } catch (err) {
-    log.error('auth', `Could not deliver the password recovery link for '${username}': ${err.message}`, { username });
+    log.error('auth', `Could not deliver the ${what} for '${username}': ${err.message}`, { username, event });
   }
 }
+
+/** Hands a recovery link to the operator's notifier. Never throws. */
+function deliverRecoveryLink(username, recovery) {
+  return notifyAccountOwner(username, 'password-recovery', { link: recovery.link, expiresAt: recovery.expiresAt }, 'password recovery link');
+}
+
+// --- SIGN-IN CODES (the way past a lockout) ---
+//
+// The account-wide and per-address sign-in limits stop guessing; they also
+// stop the owner on any client the account does not recognise — a new device,
+// or a laptop behind the same NAT as whoever is guessing. A sign-in code is
+// how the owner gets past that without anyone else being able to: it goes to
+// the account's own notification channel (or an admin hands it over), it is
+// bound to the account id, it is stored only as a hash, it allows
+// UNLOCK_CODE_ATTEMPTS attempts and then is gone, and it expires. It does not
+// replace the password — it only decides which counter an attempt is charged
+// to — and a successful sign-in with it also leaves the client a device
+// token, so the next sign-in from there is recognised.
+
+const UNLOCK_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O, 1/I
+const unlockKey = (accountId, code) => `unlock:${accountId}:${sha256Hex(code)}`;
+const normaliseUnlockCode = (code) => String(code).toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+// Spends one attempt from a code: -1 if there is no such code, otherwise the
+// attempts left after this one. The last attempt deletes it.
+redis.defineCommand('unlockTake', {
+  numberOfKeys: 1,
+  lua: `
+    local left = redis.call('DECR', KEYS[1])
+    if left < 0 then redis.call('DEL', KEYS[1]) return -1 end
+    if left == 0 then redis.call('DEL', KEYS[1]) end
+    return left
+  `,
+});
+
+/** A fresh code for the account: 10 characters, 50 bits, shown as XXXXX-XXXXX. */
+async function issueUnlockCode(accountId) {
+  const bytes = crypto.randomBytes(10);
+  const code = Array.from(bytes, (b) => UNLOCK_ALPHABET[b % 32]).join('');
+  await redis.set(unlockKey(accountId, code), String(UNLOCK_CODE_ATTEMPTS), 'EX', UNLOCK_CODE_TTL_SECONDS);
+  return {
+    code: `${code.slice(0, 5)}-${code.slice(5)}`,
+    expiresAt: new Date(Date.now() + UNLOCK_CODE_TTL_SECONDS * 1000).toISOString(),
+  };
+}
+
+/**
+ * Takes an attempt from the code, if it is one of this account's.
+ * @returns {Promise<{ key: string } | null>}
+ */
+async function takeUnlockAttempt(accountId, code) {
+  const normalised = normaliseUnlockCode(code);
+  if (normalised.length !== 10) return null;
+  const key = unlockKey(accountId, normalised);
+  if (!(await redis.exists(key))) return null;
+  return (await redis.unlockTake(key)) >= 0 ? { key } : null;
+}
+
+/**
+ * Sends a sign-in code to the account's owner, if there is such an active
+ * account and the asking is within limits. Says nothing either way.
+ */
+async function requestUnlockCode(username, ip) {
+  const source = clientKey(ip);
+  const sourceSlot = await limiter.take('unlock:source', source, UNLOCK_REQUEST_SOURCE_LIMIT);
+  if (!sourceSlot.allowed) return;
+  const accountSlot = await limiter.take('unlock:account', username, UNLOCK_REQUEST_ACCOUNT_LIMIT);
+  const userData = await getUser(username);
+  if (!accountSlot.allowed || !userData?.id || userData.status === ACCOUNT_STATUS.suspended) {
+    log.audit('auth', 'Sign-in code not sent', {
+      username, ip, reason: !accountSlot.allowed ? 'rate-limited' : !userData?.id ? 'unknown-user' : 'suspended',
+    });
+    return;
+  }
+  const { code, expiresAt } = await issueUnlockCode(userData.id);
+  await notifyAccountOwner(username, 'sign-in-code', { code, expiresAt }, 'sign-in code');
+}
+
+/**
+ * POST /auth/unlock — { username }
+ * "I am locked out on this device." Always 202, at once, whether or not the
+ * account exists; for a real one, a sign-in code goes to its owner.
+ */
+app.post('/auth/unlock', validate({ body: { username: v.accountName } }), async (req, res) => {
+  res.status(202).json({
+    message: 'If that account exists, a one-time sign-in code has been sent to its owner. Sign in with it (unlockCode) within 15 minutes.',
+  });
+  await requestUnlockCode(req.body.username, req.ip).catch((err) =>
+    log.error('auth', `Sign-in code request failed: ${err.message}`, { error: err.message }));
+});
 
 /**
  * POST /auth/password-recovery — { username }
@@ -1966,6 +2258,27 @@ app.post('/auth/password-recovery/complete', validate({
 
 // --- ADMIN ROUTES ---
 
+/**
+ * POST /admin/users/:username/unlock-code
+ * A one-time sign-in code for an account that is locked out on its own
+ * devices, for an admin to hand over when no notification channel is
+ * configured. The admin learns no password; the code does nothing without one.
+ */
+app.post('/admin/users/:username/unlock-code', authenticateJWT, requireAdmin, validate({ params: usernameParam }), async (req, res) => {
+  const { username } = req.params;
+  const id = await getUserId(username);
+  if (!id) return res.status(404).json({ error: `User '${username}' not found` });
+
+  const issued = await issueUnlockCode(id);
+  log.audit('admin', `Admin '${req.user.username}' issued a sign-in code for '${username}'`, {
+    actor: req.user.username, target: username, expiresAt: issued.expiresAt,
+  });
+  res.json({
+    message: `Sign-in code issued for '${username}'. With their password it gets them past a lockout, ${UNLOCK_CODE_ATTEMPTS} attempts, for ${UNLOCK_CODE_TTL_SECONDS / 60} minutes.`,
+    ...issued,
+  });
+});
+
 // -- Users --
 
 app.get('/admin/users', authenticateJWT, requireAdmin, async (req, res) => {
@@ -2037,14 +2350,19 @@ app.delete('/admin/users/:username', authenticateJWT, requireAdmin, validate({ p
   }
 
   const subject = await userSubjectFor(username);
-  // Every grant this account holds (tenant-qualified ones included) and any
+  // The account goes FIRST: removing its record and the id -> account mapping
+  // ends its sessions with this write, cancels its pending requests, and makes
+  // every grant that checks the mapping (an approval being committed right
+  // now, say) fail from here on. Only then is what it held cleaned up — the
+  // other way round, an approval committed in between would write a grant and
+  // a username-keyed membership back after the purge, for whoever signs up
+  // under the name next to inherit.
+  await deleteUser(username);
+  // Every grant this account held (tenant-qualified ones included) and any
   // policy written for it directly; the membership Sets are ours to clean up.
   await withCasbin(() => enforcer.deleteRolesForUser(subject));
   await withCasbin(() => enforcer.removeFilteredPolicy(0, subject));
   const purgedFrom = await tenancy.purgeUserFromAllTenants(username);
-  // Removes the id -> account mapping every token is looked up by, so the
-  // account's tokens stop authenticating with this write.
-  await deleteUser(username);
 
   log.audit('admin', `Admin '${req.user.username}' deleted user '${username}'`, {
     purgedFromTenants: purgedFrom,
@@ -2378,10 +2696,10 @@ app.post('/admin/requests/:id/approve', authenticateJWT, requireAdmin, validate(
     if (!(await tenancy.tenantRoleExists(request.tenant, role))) {
       return res.status(404).json({ error: `Role '${role}' does not exist in tenant '${request.tenant}'` });
     }
-    // Decided first, granted second: of two approvals racing, one grants.
-    const tenantResolved = await resolveAccessRequest(id, 'approved', req.user.username, role);
-    if (!tenantResolved) return res.status(409).json({ error: `Request already ${(await getAccessRequest(id))?.status || 'closed'}` });
-    await tenancy.grantTenantRole(request.tenant, requester.username, role);
+    // Decided and granted in one step, to the account by id (commitApproval).
+    const committed = await commitApproval({ request, requester, role, tenantId: request.tenant, actor: req.user.username });
+    if (!committed.ok) return answerFailedApproval(res, committed, { request, role, tenantId: request.tenant, actor: req.user.username });
+    const tenantResolved = committed.request;
     log.audit('admin', `Admin '${req.user.username}' approved request ${id} — granted '${role}' to '${requester.username}' in tenant '${request.tenant}'`, {
       actor: req.user.username, target: requester.username, tenant: request.tenant, role, requestId: id,
     });
@@ -2395,11 +2713,9 @@ app.post('/admin/requests/:id/approve', authenticateJWT, requireAdmin, validate(
     return res.status(404).json({ error: `Role '${role}' does not exist` });
   }
 
-  const resolved = await resolveAccessRequest(id, 'approved', req.user.username, role);
-  if (!resolved) return res.status(409).json({ error: `Request already ${(await getAccessRequest(id))?.status || 'closed'}` });
-  await noteGrantedRole(requester.username, role);
-  await withCasbin(() => enforcer.addRoleForUser(userSubject(requester.id), platformRoleSubject(role)));
-  await addRoleToIndex(role);
+  const committed = await commitApproval({ request, requester, role, actor: req.user.username });
+  if (!committed.ok) return answerFailedApproval(res, committed, { request, role, actor: req.user.username });
+  const resolved = committed.request;
 
   log.audit('admin', `Admin '${req.user.username}' approved request ${id} — granted '${role}' to '${requester.username}'`, {
     actor: req.user.username, target: requester.username, role, requestId: id,
@@ -3608,9 +3924,10 @@ app.post('/tenants/:tenantId/requests/:id/approve', authenticateJWT, validate({
   if (!(await tenancy.isTenantMember(tenantId, requester.username))
       && !alsoRequires(req, res, 'members', 'Approving a request from someone who is not yet a member')) return;
 
-  const resolved = await resolveAccessRequest(id, 'approved', req.user.username, role);
-  if (!resolved) return res.status(409).json({ error: `Request already ${(await getAccessRequest(id))?.status || 'closed'}` });
-  await tenancy.grantTenantRole(tenantId, requester.username, role);
+  // Decided and granted in one step, to the account by id (commitApproval).
+  const committed = await commitApproval({ request, requester, role, tenantId, actor: req.user.username });
+  if (!committed.ok) return answerFailedApproval(res, committed, { request, role, tenantId, actor: req.user.username });
+  const resolved = committed.request;
 
   log.audit('tenant', `'${req.user.username}' approved request ${id} — granted '${role}' to '${requester.username}' in tenant '${tenantId}'`, {
     actor: req.user.username, tenant: tenantId, target: requester.username, role, requestId: id,
@@ -3793,6 +4110,30 @@ app.delete('/admin/tenants/:tenantId', authenticateJWT, requireAdmin, validate({
 
 // --- DYNAMIC API GATEWAY (AuthZ + Proxy) ---
 
+// What a service is given instead of the caller's token: a short-lived
+// assertion, signed by the gateway with its RS256 key (verifiable with
+// /oauth/jwks, not mintable by anyone who can verify it), addressed to that
+// one service (aud "service:<name>"), naming the caller (sub = account id).
+// Useless at any other service and at the gateway itself. Reused for a while
+// per caller and service, since signing costs a little on every request; the
+// gateway still authorises each request before sending one.
+const ASSERTION_TTL_SECONDS = 60;
+const ASSERTION_REUSE_SECONDS = 30;
+const assertionCache = new Map();
+
+function serviceAssertionFor(user, serviceName) {
+  const key = `${user.id}\n${serviceName}`;
+  const now = Math.floor(Date.now() / 1000);
+  const cached = assertionCache.get(key);
+  if (cached && cached.exp - now > ASSERTION_TTL_SECONDS - ASSERTION_REUSE_SECONDS) return cached.token;
+
+  const token = oidc.signServiceAssertion({ subject: user.id, username: user.username, service: serviceName, ttlSeconds: ASSERTION_TTL_SECONDS });
+  assertionCache.delete(key);
+  assertionCache.set(key, { token, exp: now + ASSERTION_TTL_SECONDS });
+  if (assertionCache.size > 5000) assertionCache.delete(assertionCache.keys().next().value);
+  return token;
+}
+
 
 
 app.use('/gateway/:serviceName', authenticateProxied, validate({ params: { serviceName: v.tenantId } }), async (req, res, next) => {
@@ -3831,6 +4172,7 @@ app.use('/gateway/:serviceName', authenticateProxied, validate({ params: { servi
   // the FULL path, so it is restored before proxying — together with the
   // query string, which setting this to the path alone used to throw away.
   req.url = target.url;
+  const assertion = serviceAssertionFor(req.user, serviceName);
 
   const proxy = createProxyMiddleware({
     target: serviceConfig.baseUrl,
@@ -3846,9 +4188,8 @@ app.use('/gateway/:serviceName', authenticateProxied, validate({ params: { servi
         // whole platform — every tenant the caller belongs to, and the admin
         // API if they are an admin — and a service needs none of that to
         // answer one request. Forwarding it handed each tenant's backend a
-        // working token for everyone who called it. A service is told who is
-        // calling instead; it receives the token itself only if the platform
-        // operator has listed it in FORWARD_AUTHORIZATION_TO.
+        // working token for everyone who called it. A service gets its own,
+        // dedicated credential instead: X-Gateway-Assertion (above).
         // The request-target goes out exactly as it was authorised: http-proxy
         // would otherwise re-parse it and collapse "//" on the way.
         proxyReq.path = upstreamRequestTarget(serviceConfig.baseUrl, target);
@@ -3856,9 +4197,13 @@ app.use('/gateway/:serviceName', authenticateProxied, validate({ params: { servi
         // this route has read it anyway — then its original bytes are sent.
         resendConsumedBody(proxyReq, req);
 
-        if (!FORWARD_AUTHORIZATION_TO.has(serviceName)) proxyReq.removeHeader('authorization');
-        // Always set, so a caller cannot supply their own. The name is
-        // URI-encoded: usernames may contain characters a header cannot.
+        proxyReq.removeHeader('authorization');
+        // Always set, so a caller cannot supply their own. X-Gateway-Assertion
+        // is the one to trust: signed, short-lived, for this service only. The
+        // two plain headers are a convenience for services that sit where only
+        // the gateway can reach them. The name is URI-encoded: usernames may
+        // contain characters a header cannot.
+        proxyReq.setHeader('X-Gateway-Assertion', assertion);
         proxyReq.setHeader('X-Gateway-User-Id', req.user.id);
         proxyReq.setHeader('X-Gateway-User', encodeURIComponent(req.user.username));
 
@@ -3928,6 +4273,7 @@ const oidc = createOidcProvider({
   secret: JWT_SECRET,
   checkCredentials,
   replaceTemporaryPassword,
+  requestUnlockCode,
   passwordProblem: (password) => v.newPassword(password).error || null,
   // A session token for the account — only if it is the same account, still
   // active, at the same security version it signed in at. Anything that
@@ -4136,13 +4482,10 @@ class BootstrapDeliveryError extends Error {}
  */
 function deliverInitialAdminPassword(password) {
   try {
-    fs.mkdirSync(path.dirname(INITIAL_ADMIN_PASSWORD_FILE), { recursive: true, mode: 0o700 });
-    // A fresh file, never one that is already there: 'wx' refuses to follow a
-    // symlink or reuse a file somebody else created with looser permissions.
-    fs.rmSync(INITIAL_ADMIN_PASSWORD_FILE, { force: true });
-    fs.writeFileSync(INITIAL_ADMIN_PASSWORD_FILE, `${password}\n`, { mode: 0o600, flag: 'wx' });
+    // A fresh, private file — never through or over a symlink (private-file.js).
+    writePrivateFile(INITIAL_ADMIN_PASSWORD_FILE, `${password}\n`);
   } catch (err) {
-    throw new BootstrapDeliveryError(`cannot write the initial administrator's one-time password to ${INITIAL_ADMIN_PASSWORD_FILE} (${err.code || err.message})`);
+    throw new BootstrapDeliveryError(`cannot write the initial administrator's one-time password: ${err.message}`);
   }
   console.log(`[IAM] One-time password for '${BOOTSTRAP_ADMIN_USERNAME}' written to ${INITIAL_ADMIN_PASSWORD_FILE}`);
   console.log('[IAM] It must be changed at first login; nothing else works for that account until it is.');

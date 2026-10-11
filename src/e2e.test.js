@@ -35,7 +35,8 @@ const jwt = require('jsonwebtoken');
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  gateway: 'http://localhost:3000',
+  // GATEWAY_URL, like the other checks, for a gateway not on the default port.
+  gateway: (process.env.GATEWAY_URL || 'http://localhost:3000').replace(/\/+$/, ''),
   registry: 'http://localhost:3001',
   llm: 'http://localhost:8080',
   vision: 'http://localhost:8081',
@@ -2546,7 +2547,8 @@ async function runPolicySyncTests() {
   const peerPort = 3400 + Math.floor(Math.random() * 300);
   const peer = `http://localhost:${peerPort}`;
   const child = spawn(process.execPath, [path.join(__dirname, 'main.reg.js')], {
-    env: { ...process.env, PORT: String(peerPort) },
+    // One deployment, one public address: it is the issuer every token names.
+    env: { ...process.env, PORT: String(peerPort), PUBLIC_URL: CONFIG.gateway },
     stdio: 'ignore',
   });
 
@@ -3533,6 +3535,7 @@ async function runOperationsTests() {
     env: {
       ...process.env,
       PORT: String(peerPort),
+      PUBLIC_URL: CONFIG.gateway,
       METRICS_TOKEN: metricsToken,
       LOG_FORWARD_URL: `${collectorUrl}/logs`,
       LOG_FORWARD_TOKEN: forwardToken,
@@ -3714,7 +3717,8 @@ function listen(handler) {
 function startGateway(env = {}) {
   const port = 3800 + Math.floor(Math.random() * 180);
   const child = spawn(process.execPath, [path.join(__dirname, 'main.reg.js')], {
-    env: { ...process.env, PORT: String(port), ...env },
+    // One deployment, one public address (the issuer every token names), unless the test says otherwise.
+    env: { ...process.env, PORT: String(port), PUBLIC_URL: CONFIG.gateway, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -4190,14 +4194,25 @@ async function runBootstrapTests() {
       assertEqual(await scratch.client.exists('iam:bootstrap:initial-admin'), 0, 'the bootstrap was marked done');
     });
 
-    await test('With a writable file it is written there, privately — never to the output — even over a planted symlink', async () => {
+    await test('A symlink planted at the password path — even a dangling one — is refused, and nothing is created', async () => {
       const elsewhere = path.join(scratch.dir, 'elsewhere');
       fs.symlinkSync(elsewhere, passwordFile);
       const gateway = startGateway(env(passwordFile));
+      const code = await Promise.race([gateway.exited, pause(20000).then(() => 'still running')]);
+      if (code === 'still running') await gateway.stop();
+      assertEqual(code, 1, 'exit code');
+      assert(/symbolic link/.test(gateway.output()), `it should say why: ${gateway.output().slice(-300)}`);
+      assert(fs.lstatSync(passwordFile).isSymbolicLink(), 'the symlink was removed or replaced');
+      assert(!fs.existsSync(elsewhere), 'the password was written through the symlink');
+      assertEqual(await scratch.client.exists('user:admin'), 0, 'an admin account exists');
+      fs.unlinkSync(passwordFile);
+    });
+
+    await test('With a writable path the password is written there, privately — never to the output', async () => {
+      const gateway = startGateway(env(passwordFile));
       try {
         assert(await gateway.ready(), `the gateway did not start: ${gateway.output().slice(-300)}`);
-        assert(!fs.lstatSync(passwordFile).isSymbolicLink(), 'the symlink was followed');
-        assert(!fs.existsSync(elsewhere), 'the password was written through the symlink');
+        assert(fs.lstatSync(passwordFile).isFile(), 'a regular file');
         assertEqual(fs.statSync(passwordFile).mode & 0o077, 0, 'permissions of the password file');
         const password = fs.readFileSync(passwordFile, 'utf8').trim();
         assert(password.length >= 24, 'password length');
@@ -4322,6 +4337,402 @@ async function runTrustProxyTests() {
     assertEqual(proxyaddr.compile('::/64')('203.0.113.9', 0), false, 'IPv4 client under an IPv6 trust range');
     assertEqual(proxyaddr.compile('::ffff:203.0.113.0/120')('203.0.113.9', 0), true, 'an IPv4-mapped trust range still works');
   });
+}
+
+// ── 20. FINAL REVIEW — regression tests for the third security review ────────
+
+// 20a ─────────────────────────────────────────────────────────────────────────
+async function runLoginRaceTests() {
+  suite('Final review — a sign-in in flight during a password change gets no usable token');
+
+  const created = [];
+  const redis = redisClient();
+  // Behind a (loopback) proxy, so many attempts can come from many addresses
+  // at once without tripping the per-address lockout.
+  const peer = startGateway({ TRUST_PROXY: 'loopback' });
+  const at = (ip) => ({ 'X-Forwarded-For': ip });
+
+  try {
+    if (!(await peer.ready())) throw new Error(`the proxied gateway did not start: ${peer.output().slice(-300)}`);
+
+    await test('No token obtained with the old password works once the change has completed', async () => {
+      const username = uniqueUser('race_login');
+      let password = 'Race-Login-Pass-0!';
+      await createUserAndLogin(username, password);
+      created.push(username);
+      let straddled = 0;
+
+      for (let round = 1; round <= 6 && straddled === 0; round++) {
+        const old = password;
+        const next = `Race-Login-Pass-${round}!`;
+        const session = await login(username, old);
+        const attempts = Array.from({ length: 30 }, (_, i) => pause(i * 4).then(async () => {
+          const res = await request('POST', `${peer.url}/auth/login`, { body: { username, password: old }, headers: at(`198.18.${round}.${i + 1}`) });
+          return { ...res, endedAt: Date.now() };
+        }));
+        await pause(40);
+        const change = await request('POST', `${CONFIG.gateway}/auth/change-password`, {
+          token: session, body: { currentPassword: old, newPassword: next },
+        });
+        assertEqual(change.status, 200, `password change in round ${round}`);
+        const changedAt = Date.now();
+        password = next;
+
+        const results = await Promise.all(attempts);
+        for (const r of results) {
+          if (r.endedAt > changedAt && [200, 409].includes(r.status)) straddled += 1;
+          if (r.status !== 200) continue;
+          const me = await request('GET', `${CONFIG.gateway}/me`, { token: r.body.token });
+          assertEqual(me.status, 401, `a token from a login with the OLD password, after the change (round ${round})`);
+        }
+      }
+      assert(straddled > 0, 'no attempt was in flight across a password change — the race was not exercised');
+    });
+
+    await test('Upgrading a legacy password hash cannot overwrite a password changed meanwhile', async () => {
+      const bcrypt = require('bcrypt');
+      // A password change on a bcrypt account does a bcrypt check and two
+      // Argon2 hashes before it writes; a login does one of each. The upgrade
+      // overwrites the change when the login starts after the change but its
+      // write lands later — so the offsets span that window.
+      for (const delay of [80, 120, 160, 200, 240, 280]) {
+        const username = uniqueUser('race_rehash');
+        await createUserAndLogin(username, 'Legacy-Pass-1!');
+        created.push(username);
+        // A session first — signing in would itself upgrade the hash — then an
+        // account still holding a bcrypt hash from before Argon2.
+        const session = await login(username, 'Legacy-Pass-1!');
+        await redis.hset(`user:${username}`, 'password', await bcrypt.hash('Legacy-Pass-1!', 12));
+        const change = request('POST', `${CONFIG.gateway}/auth/change-password`, {
+          token: session, body: { currentPassword: 'Legacy-Pass-1!', newPassword: 'Changed-Pass-1!' },
+        });
+        await pause(delay);
+        const upgrade = request('POST', `${peer.url}/auth/login`, { body: { username, password: 'Legacy-Pass-1!' }, headers: at('198.18.200.1') });
+        assertEqual((await change).status, 200, 'the password change');
+        await upgrade;
+        assertEqual((await request('POST', `${peer.url}/auth/login`, { body: { username, password: 'Changed-Pass-1!' }, headers: at('198.18.200.2') })).status, 200, `the new password works (offset ${delay}ms)`);
+        assertEqual((await request('POST', `${peer.url}/auth/login`, { body: { username, password: 'Legacy-Pass-1!' }, headers: at('198.18.200.3') })).status, 401, `the old password does not (offset ${delay}ms)`);
+      }
+    });
+  } finally {
+    await peer.stop();
+    for (const u of created) await request('DELETE', `${CONFIG.gateway}/admin/users/${u}`, { token: state.adminToken });
+    redis.disconnect();
+  }
+}
+
+// 20b ─────────────────────────────────────────────────────────────────────────
+async function runApprovalRaceTests() {
+  suite('Final review — an approval racing the deletion and re-creation of its requester');
+
+  const password = 'Approval-Race-1!';
+  const tenant = 'llm';
+  const role = 'service_user';
+  const leftovers = new Set();
+
+  try {
+    await test('Whatever the interleaving, a newcomer under the same name never receives the role or membership', async () => {
+      const outcomes = { approved: 0, cancelled: 0 };
+      for (let i = 0; i < 12; i++) {
+        const username = uniqueUser('race_appr');
+        leftovers.add(username);
+        const token = await createUserAndLogin(username, password);
+        const made = await request('POST', `${CONFIG.gateway}/requests`, { token, body: { tenant, role } });
+        assertEqual(made.status, 201, 'request');
+        const id = made.body.request.id;
+
+        const approve = pause(i % 4).then(() => request('POST', `${CONFIG.gateway}/tenants/${tenant}/requests/${id}/approve`, { token: state.adminToken }));
+        const replace = pause(3 - (i % 4)).then(async () => {
+          await request('DELETE', `${CONFIG.gateway}/admin/users/${username}`, { token: state.adminToken });
+          return request('POST', `${CONFIG.gateway}/auth/signup`, { body: { username, password: 'Newcomer-Pass-1!' } });
+        });
+        const [approval, signup] = await Promise.all([approve, replace]);
+        assertEqual(signup.status, 201, 'the newcomer signs up under the freed name');
+
+        const members = (await request('GET', `${CONFIG.gateway}/tenants/${tenant}/users`, { token: state.adminToken })).body.users.map((u) => u.username);
+        assert(!members.includes(username), `round ${i + 1}: the newcomer '${username}' is a member of '${tenant}' (approval answered ${approval.status})`);
+        const newcomer = await login(username, 'Newcomer-Pass-1!');
+        const mine = (await request('GET', `${CONFIG.gateway}/me`, { token: newcomer })).body;
+        assert(!(mine.tenants || []).some((t) => t.id === tenant), `round ${i + 1}: the newcomer belongs to '${tenant}'`);
+        assert(!(mine.roles || []).some((r) => String(r).includes(`${tenant}:${role}`)), `round ${i + 1}: the newcomer holds the role`);
+
+        const final = (await request('GET', `${CONFIG.gateway}/admin/requests`, { token: state.adminToken })).body.requests.find((r) => r.id === id);
+        assert(['approved', 'cancelled'].includes(final.status), `round ${i + 1}: the request was left '${final.status}'`);
+        if (approval.status === 200) assertEqual(final.status, 'approved', `round ${i + 1}: approved status after a 200`);
+        // An approval that did not complete must not leave the request approved (with nothing granted).
+        if (final.status === 'approved') assertEqual(approval.status, 200, `round ${i + 1}: request approved although the approval answered`);
+        outcomes[final.status] += 1;
+      }
+      assert(outcomes.approved + outcomes.cancelled === 12, `outcomes: ${JSON.stringify(outcomes)}`);
+    });
+
+    await test('An approval that cannot be committed leaves the request pending, to be decided again', async () => {
+      const owner = uniqueUser('appr_owner');
+      const asker = uniqueUser('appr_asker');
+      leftovers.add(owner);
+      leftovers.add(asker);
+      const ownerToken = await createUserAndLogin(owner, password);
+      const id = `appr${randomUUID().replace(/-/g, '').slice(0, 10)}`;
+      assertEqual((await request('POST', `${CONFIG.gateway}/tenants/register`, { token: ownerToken, body: { name: id, baseUrl: 'http://localhost:9399' } })).status, 201, 'tenant');
+      await request('POST', `${CONFIG.gateway}/tenants/${id}/roles`, { token: ownerToken, body: { role: 'reader' } });
+      const askerToken = await createUserAndLogin(asker, password);
+      const made = await request('POST', `${CONFIG.gateway}/requests`, { token: askerToken, body: { tenant: id, role: 'reader' } });
+
+      // The role disappears before the approval is committed.
+      await request('DELETE', `${CONFIG.gateway}/tenants/${id}/roles/reader`, { token: ownerToken });
+      const refused = await request('POST', `${CONFIG.gateway}/tenants/${id}/requests/${made.body.request.id}/approve`, { token: ownerToken });
+      assertEqual(refused.status, 404, 'approving for a role that no longer exists');
+      const queue = (await request('GET', `${CONFIG.gateway}/tenants/${id}/requests?status=pending`, { token: ownerToken })).body.requests;
+      assert(queue.some((r) => r.id === made.body.request.id), 'the request should still be pending');
+      const members = (await request('GET', `${CONFIG.gateway}/tenants/${id}/users`, { token: ownerToken })).body.users.map((u) => u.username);
+      assert(!members.includes(asker), 'nothing was granted');
+
+      // Defined again, it can be approved, and the grant arrives with the decision.
+      await request('POST', `${CONFIG.gateway}/tenants/${id}/roles`, { token: ownerToken, body: { role: 'reader' } });
+      const approved = await request('POST', `${CONFIG.gateway}/tenants/${id}/requests/${made.body.request.id}/approve`, { token: ownerToken });
+      assertEqual(approved.status, 200, 'approve after the role is back');
+      const roles = (await request('GET', `${CONFIG.gateway}/me`, { token: askerToken })).body.tenants.find((t) => t.id === id)?.roles || [];
+      assert(roles.includes('reader'), `roles after approval: ${JSON.stringify(roles)}`);
+      await request('DELETE', `${CONFIG.gateway}/admin/tenants/${id}?deregister=true`, { token: state.adminToken });
+    });
+  } finally {
+    for (const u of leftovers) await request('DELETE', `${CONFIG.gateway}/admin/users/${u}`, { token: state.adminToken });
+  }
+}
+
+// 20c ─────────────────────────────────────────────────────────────────────────
+async function runUnlockTests() {
+  suite('Final review — a locked-out owner gets in with a one-time sign-in code');
+
+  const password = 'Unlock-Owner-1!';
+  const created = [];
+  const delivered = [];
+  const notifier = await listen((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => { try { delivered.push(JSON.parse(Buffer.concat(chunks).toString())); } catch { /* ignore */ } res.end('{}'); });
+  });
+  const peer = startGateway({
+    TRUST_PROXY: 'loopback',
+    LOGIN_ACCOUNT_MAX_FAILURES: '5',
+    PASSWORD_RECOVERY_WEBHOOK_URL: `http://127.0.0.1:${notifier.port}/notify`,
+  });
+  const from = (ip, body) => request('POST', `${peer.url}/auth/login`, { body, headers: { 'X-Forwarded-For': ip } });
+  const spray = async (username, ips) => { for (const ip of ips) await from(ip, { username, password: 'sprayed-guess-x' }); };
+  async function victim(prefix) {
+    const u = uniqueUser(prefix);
+    await createUserAndLogin(u, password);
+    created.push(u);
+    return u;
+  }
+  const codeFor = async (username) => {
+    for (let i = 0; i < 30; i++) {
+      const found = delivered.find((d) => d.event === 'sign-in-code' && d.username === username);
+      if (found) return found.code;
+      await pause(100);
+    }
+    return null;
+  };
+
+  try {
+    if (!(await peer.ready())) throw new Error(`the gateway did not start: ${peer.output().slice(-300)}`);
+
+    await test('A new device, locked out by guesses sprayed from elsewhere, gets in with a code sent to the owner', async () => {
+      const u = await victim('unlock_new');
+      await spray(u, ['198.51.100.21', '198.51.100.22', '198.51.100.23', '198.51.100.24', '198.51.100.25']);
+      const locked = await from('203.0.113.80', { username: u, password });
+      assertEqual(locked.status, 429, 'the owner on a new device, before');
+      assertEqual(locked.body.code, 'SIGN_IN_LOCKED', 'code');
+
+      const ask = await request('POST', `${peer.url}/auth/unlock`, { body: { username: u }, headers: { 'X-Forwarded-For': '203.0.113.80' } });
+      assertEqual(ask.status, 202, 'asking for a code');
+      const code = await codeFor(u);
+      assert(/^[A-Z2-9]{5}-[A-Z2-9]{5}$/.test(code || ''), `the notifier received a code: ${code}`);
+
+      const inside = await from('203.0.113.80', { username: u, password, unlockCode: code });
+      assertEqual(inside.status, 200, 'with the code');
+      assertEqual((await from('203.0.113.80', { username: u, password, deviceToken: inside.body.deviceToken })).status, 200, 'the device is recognised from then on');
+      assertEqual((await from('203.0.113.80', { username: u, password, unlockCode: code })).status, 429, 'the code a second time');
+    });
+
+    await test('An owner behind the same NAT as the attacker gets in with a code an admin hands over', async () => {
+      const u = await victim('unlock_nat');
+      for (let i = 0; i < 5; i++) await from('192.0.2.77', { username: u, password: `nat-guess-${i}-xx` });
+      assertEqual((await from('192.0.2.77', { username: u, password })).status, 429, 'the owner from the shared address');
+      const issued = await request('POST', `${CONFIG.gateway}/admin/users/${u}/unlock-code`, { token: state.adminToken });
+      assertEqual(issued.status, 200, 'admin issues a code');
+      assertEqual((await from('192.0.2.77', { username: u, password, unlockCode: issued.body.code })).status, 200, 'with the code, from the shared address');
+    });
+
+    await test('A code does not stand in for the password, belongs to one account, and runs out', async () => {
+      const u = await victim('unlock_rules');
+      const other = await victim('unlock_other');
+      await spray(u, ['198.51.100.31', '198.51.100.32', '198.51.100.33', '198.51.100.34', '198.51.100.35']);
+      const code = (await request('POST', `${CONFIG.gateway}/admin/users/${u}/unlock-code`, { token: state.adminToken })).body.code;
+
+      await spray(other, ['198.51.100.41', '198.51.100.42', '198.51.100.43', '198.51.100.44', '198.51.100.45']);
+      assertEqual((await from('203.0.113.90', { username: other, password, unlockCode: code })).status, 429, 'another account\'s code');
+      for (let i = 0; i < 5; i++) {
+        assertEqual((await from('203.0.113.91', { username: u, password: `wrong-${i}-xxxx`, unlockCode: code })).status, 401, `a wrong password with the code (${i + 1})`);
+      }
+      assertEqual((await from('203.0.113.91', { username: u, password, unlockCode: code })).status, 429, 'the right password once the code is used up');
+      assertEqual((await from('203.0.113.92', { username: u, password, unlockCode: 'AAAAA-BBBBB' })).status, 429, 'a made-up code');
+    });
+
+    await test('Asking for a code answers the same for any name, and sends nothing for an unknown one', async () => {
+      const before = delivered.length;
+      const ghost = await request('POST', `${peer.url}/auth/unlock`, { body: { username: uniqueUser('ghost') } });
+      const real = await request('POST', `${peer.url}/auth/unlock`, { body: { username: created[0] } });
+      assertEqual(ghost.status, real.status, 'status');
+      assertEqual(JSON.stringify(ghost.body), JSON.stringify(real.body), 'body');
+      await pause(800);
+      assert(delivered.slice(before).every((d) => d.username === created[0]), 'a code was sent for an account that does not exist');
+    });
+
+    await test('The sign-in page offers the code when the client is locked out, and takes it', async () => {
+      const u = await victim('unlock_page');
+      const redirectUri = 'https://unlock.example.test/cb';
+      const client = (await request('POST', `${CONFIG.gateway}/admin/oidc/clients`, { token: state.adminToken, body: { name: 'Unlock test', redirectUris: [redirectUri] } })).body.client;
+      try {
+        await spray(u, ['198.51.100.51', '198.51.100.52', '198.51.100.53', '198.51.100.54', '198.51.100.55']);
+        const verifier = Buffer.from(randomBytes(48)).toString('base64url');
+        const params = new URLSearchParams({
+          response_type: 'code', client_id: client.clientId, redirect_uri: redirectUri, scope: 'openid', state: 's',
+          code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256',
+        });
+        const page = await (await fetch(`${peer.url}/oauth/authorize?${params}`, { headers: { 'X-Forwarded-For': '203.0.113.95' } })).text();
+        const blob = page.match(/name="request" value="([^"]+)"/)[1];
+        const post = (fields) => fetch(`${peer.url}/oauth/authorize`, {
+          method: 'POST', redirect: 'manual',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Forwarded-For': '203.0.113.95' },
+          body: new URLSearchParams({ request: blob, ...fields }),
+        });
+
+        const locked = await post({ step: 'login', username: u, password });
+        const lockedPage = await locked.text();
+        assertEqual(locked.status, 429, 'locked out on the page');
+        assert(/Send me a sign-in code/.test(lockedPage) && /name="unlock_code"/.test(lockedPage), 'the page offers a sign-in code');
+
+        const asked = await post({ step: 'unlock-request', username: u });
+        assertEqual(asked.status, 200, 'asking from the page');
+        const code = await codeFor(u);
+        const signedIn = await post({ step: 'login', username: u, password, unlock_code: code });
+        assertEqual(signedIn.status, 303, 'signing in with the code');
+        assert(new URL(signedIn.headers.get('location')).searchParams.get('code'), 'an authorization code was issued');
+      } finally {
+        await request('DELETE', `${CONFIG.gateway}/admin/oidc/clients/${client.clientId}`, { token: state.adminToken });
+      }
+    });
+  } finally {
+    await peer.stop();
+    await notifier.close();
+    for (const u of created) await request('DELETE', `${CONFIG.gateway}/admin/users/${u}`, { token: state.adminToken });
+  }
+}
+
+// 20d ─────────────────────────────────────────────────────────────────────────
+async function runTokenClaimTests() {
+  suite('Final review — an access token must be for this gateway, from this gateway, and expire');
+
+  if (!process.env.JWT_SECRET) {
+    skip('Token claims', 'needs JWT_SECRET (in .env or exported) to make tokens by hand');
+    return;
+  }
+  const { sub, tokenVersion } = claimsOf(state.adminToken);
+  const now = Math.floor(Date.now() / 1000);
+  const forge = (claims) => {
+    const payload = { sub, tokenVersion, jti: randomUUID(), token_use: 'access', iss: CONFIG.gateway, aud: 'iam-gateway', iat: now, exp: now + 600, ...claims };
+    for (const key of Object.keys(payload)) if (payload[key] === undefined) delete payload[key];
+    return jwt.sign(payload, process.env.JWT_SECRET, { algorithm: 'HS256', noTimestamp: !('iat' in payload) });
+  };
+  const status = async (token) => (await request('GET', `${CONFIG.gateway}/me`, { token })).status;
+
+  await test('Control: a hand-made token with every claim right is accepted', async () => {
+    assertEqual(await status(forge({})), 200, 'status');
+  });
+
+  const refused = {
+    'no expiry': { exp: undefined },
+    'a lifetime longer than the gateway issues': { exp: now + 400 * 24 * 3600 },
+    'another issuer': { iss: 'https://evil.example.test' },
+    'no issuer': { iss: undefined },
+    'another audience': { aud: 'billing-service' },
+    'no audience': { aud: undefined },
+    'no token type': { token_use: undefined },
+  };
+  for (const [what, claims] of Object.entries(refused)) {
+    await test(`A token with ${what} is refused, though signed with the gateway's own secret`, async () => {
+      assertEqual(await status(forge(claims)), 403, 'status');
+    });
+  }
+
+  await test('Tokens the gateway issues carry issuer, audience, type and expiry', async () => {
+    const claims = claimsOf(state.adminToken);
+    assertEqual(claims.iss, CONFIG.gateway, 'iss');
+    assertEqual(claims.aud, 'iam-gateway', 'aud');
+    assertEqual(claims.token_use, 'access', 'token_use');
+    assert(claims.exp - claims.iat === 24 * 3600, `lifetime ${claims.exp - claims.iat}`);
+  });
+}
+
+// 20e ─────────────────────────────────────────────────────────────────────────
+async function runServiceAssertionTests() {
+  suite('Final review — a service receives its own credential, never the caller\'s token');
+
+  const id = `assert${randomUUID().replace(/-/g, '').slice(0, 10)}`;
+  const owner = uniqueUser('assert_owner');
+  const password = 'Assertion-Owner-1!';
+  let token;
+  let lastHeaders = null;
+  const echo = await listen((req, res) => { lastHeaders = req.headers; res.setHeader('Content-Type', 'application/json'); res.end('{"ok":true}'); });
+
+  const verifyWithJwks = async (assertion, audience) => {
+    const jwks = (await request('GET', `${CONFIG.gateway}/oauth/jwks`)).body;
+    const { kid } = JSON.parse(Buffer.from(assertion.split('.')[0], 'base64url').toString());
+    const key = createPublicKey({ key: jwks.keys.find((k) => k.kid === kid), format: 'jwk' });
+    return jwt.verify(assertion, key, { algorithms: ['RS256'], issuer: CONFIG.gateway, audience });
+  };
+
+  try {
+    await test('A service registered as a tenant is called through the gateway', async () => {
+      token = await createUserAndLogin(owner, password);
+      const res = await request('POST', `${CONFIG.gateway}/tenants/register`, { token, body: { name: id, baseUrl: `http://localhost:${echo.port}`, endpoints: [`/${id}/who`] } });
+      assertEqual(res.status, 201, 'register');
+      // Administering a tenant is not calling it: the owner takes the default role too.
+      assertEqual((await request('POST', `${CONFIG.gateway}/tenants/${id}/users`, { token, body: { username: owner, role: 'service_user' } })).status, 201, 'role');
+      token = await login(owner, password);
+      assertEqual((await request('GET', `${CONFIG.gateway}/gateway/${id}/who`, { token })).status, 200, 'call');
+    });
+
+    await test('It gets a signed assertion for itself alone — and no Authorization header', async () => {
+      await request('GET', `${CONFIG.gateway}/gateway/${id}/who`, { token });
+      assert(!('authorization' in lastHeaders), 'the caller\'s Authorization header reached the service');
+      const assertion = lastHeaders['x-gateway-assertion'];
+      assert(assertion, 'no X-Gateway-Assertion header');
+      const claims = await verifyWithJwks(assertion, `service:${id}`);
+      assertEqual(claims.sub, claimsOf(token).sub, 'sub is the caller\'s account id');
+      assertEqual(claims.token_use, 'gateway-assertion', 'token_use');
+      assert(claims.exp - claims.iat <= 60, `lifetime ${claims.exp - claims.iat}s`);
+      let otherAudience = null;
+      try { await verifyWithJwks(assertion, 'service:llm'); } catch (err) { otherAudience = err; }
+      assert(otherAudience, 'the assertion verified for another service');
+    });
+
+    await test('A caller cannot supply their own assertion', async () => {
+      await request('GET', `${CONFIG.gateway}/gateway/${id}/who`, { token, headers: { 'X-Gateway-Assertion': 'forged.by.caller' } });
+      assert(lastHeaders['x-gateway-assertion'] !== 'forged.by.caller', 'the caller\'s header reached the service');
+      await verifyWithJwks(lastHeaders['x-gateway-assertion'], `service:${id}`);
+    });
+
+    await test('The assertion is not a key to the gateway', async () => {
+      const assertion = lastHeaders['x-gateway-assertion'];
+      assertEqual((await request('GET', `${CONFIG.gateway}/me`, { token: assertion })).status, 403, 'using it as a bearer token');
+    });
+  } finally {
+    await request('DELETE', `${CONFIG.gateway}/admin/tenants/${id}?deregister=true`, { token: state.adminToken });
+    await request('DELETE', `${CONFIG.gateway}/admin/users/${owner}`, { token: state.adminToken });
+    await echo.close();
+  }
 }
 
 // ── 6b. SELF-SERVICE ACCESS REQUESTS ─────────────────────────────────────────
@@ -5573,6 +5984,11 @@ async function main() {
     { name: 'Review: first boot', fn: runBootstrapTests },
     { name: 'Review: sign-in lockout', fn: runLockoutTests },
     { name: 'Review: trusted proxies', fn: runTrustProxyTests },
+    { name: 'Final: in-flight sign-in', fn: runLoginRaceTests },
+    { name: 'Final: approval race', fn: runApprovalRaceTests },
+    { name: 'Final: sign-in codes', fn: runUnlockTests },
+    { name: 'Final: token claims', fn: runTokenClaimTests },
+    { name: 'Final: service credentials', fn: runServiceAssertionTests },
     { name: 'Swagger', fn: runSwaggerTests },
   ];
 

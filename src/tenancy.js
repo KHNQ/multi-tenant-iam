@@ -582,6 +582,9 @@ function createTenancy({ redis, withCasbin, getEnforcer, userSubjectFor, addPoli
 
 module.exports = {
   createTenancy,
+  // Key names, for a script elsewhere that writes tenant data in the same
+  // step as something else (an approved request and its grant).
+  tenantKeys: { tenant: tenantKey, roles: tenantRolesKey, members: tenantMembersKey, userTenants: userTenantsKey },
   // Pure helpers, usable without a Redis client (the registry validates
   // service names with the same rules the gateway validates tenant ids).
   validateTenantId,
