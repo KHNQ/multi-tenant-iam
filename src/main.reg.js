@@ -30,6 +30,8 @@ const { createDeviceTrust } = require('./device-trust');
 const { writePrivateFile } = require('./private-file');
 const { createAccessTokens } = require('./access-token');
 const { v, validate, bodyParseErrors, JSON_BODY_LIMIT } = require('./validation');
+const { createIdp } = require('./idp');
+const { createConsoleBff } = require('./bff');
 
 const log = createLogger('gateway');
 
@@ -139,7 +141,8 @@ const policySyncLatency = metrics.histogram('iam_policy_sync_latency_seconds',
   'From a policy change being written by any instance to this instance enforcing it (Redis clock)',
   [], [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]);
 
-const METRIC_AREAS = new Set(['auth', 'oauth', 'me', 'catalog', 'requests', 'admin', 'tenants', 'gateway', 'docs', 'assets', 'metrics']);
+const METRIC_AREAS = new Set(['auth', 'oauth', 'me', 'catalog', 'requests', 'admin', 'tenants', 'gateway', 'docs', 'assets', 'metrics',
+  'realms', 'api', 'health', 'ui', 'login', 'oauth2', 'logout']);
 function metricArea(path) {
   const first = (path.split('/')[1] || '').toLowerCase();
   if (first === '.well-known') return 'oauth';
@@ -170,13 +173,15 @@ app.use((req, res, next) => {
 // that skipped /gateway but ran on /GATEWAY would bring the problem back for
 // anyone who asked for it.
 const PROXIED_PATH = /^\/gateway(\/|$)/i;
+// The credential import reads its own (much larger) body; see idp/operations.js.
+const OWN_BODY_PATH = /^\/admin\/sync\/credentials\/?$/i;
 const parseJson = express.json({
   limit: JSON_BODY_LIMIT,
   // The bytes as they arrived, so that a body read here can still be sent on
   // exactly — see resendConsumedBody in proxy-request.js.
   verify: (req, res, buffer) => { req.rawBody = buffer; },
 });
-app.use((req, res, next) => (PROXIED_PATH.test(req.path) ? next() : parseJson(req, res, next)));
+app.use((req, res, next) => (PROXIED_PATH.test(req.path) || OWN_BODY_PATH.test(req.path) ? next() : parseJson(req, res, next)));
 app.use(bodyParseErrors);
 app.use(log.requestLogger());
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(spec, { customSiteTitle: 'IAM Gateway API' }));
@@ -4354,6 +4359,36 @@ app.delete('/admin/oidc/clients/:clientId', authenticateJWT, requireAdmin, valid
   res.json({ message: `Client '${clientId}' removed — its outstanding sign-ins and sessions have ended` });
 });
 
+// --- FAILOVER IDENTITY PROVIDER AND THE CONSOLE ---
+// Keycloak-compatible realms under /realms/{realm} (src/idp), and the
+// administration console (frontend/, served at /ui/) with its BFF API under
+// /api (src/bff). See docs/failover-idp.md.
+const IDP_BOOTSTRAP_PASSWORD_FILE = process.env.IDP_BOOTSTRAP_PASSWORD_FILE
+  || path.join(__dirname, '..', '.run', 'initial-console-admin-password');
+
+const idp = createIdp({
+  redis,
+  log,
+  metrics,
+  publicUrl: PUBLIC_URL,
+  secret: JWT_SECRET,
+  writeSecretFile: (password) => {
+    writePrivateFile(IDP_BOOTSTRAP_PASSWORD_FILE, `${password}\n`);
+    console.log(`[IdP] One-time password for the console's first administrator written to ${IDP_BOOTSTRAP_PASSWORD_FILE}`);
+  },
+  removeSecretFile: () => fs.rm(IDP_BOOTSTRAP_PASSWORD_FILE, { force: true }, () => {}),
+});
+for (const router of idp.routers) app.use(router);
+
+const consoleBff = createConsoleBff({
+  idp,
+  log,
+  publicUrl: idp.publicUrl,
+  internalUrl: (process.env.IDP_INTERNAL_URL || `http://127.0.0.1:${GATEWAY_PORT}`).replace(/\/+$/, ''),
+  uiDir: process.env.CONSOLE_UI_DIR || path.join(__dirname, '..', 'frontend', 'dist'),
+});
+app.use(consoleBff.router);
+
 // --- METRICS ENDPOINT ---
 
 /** Compares two secrets without the time taken depending on where they differ. */
@@ -4438,7 +4473,9 @@ app.use((err, req, res, next) => {
     method: req.method, path: req.originalUrl, stack: err.stack,
   });
   if (res.headersSent) return;
-  res.status(500).json({ error: 'Internal server error' });
+  const correlationId = res.getHeader('X-Request-Id');
+  if (correlationId) res.set('X-Correlation-Id', correlationId);
+  res.status(500).json({ error: 'Internal server error', correlationId });
 });
 
 // --- INITIAL ADMINISTRATOR (one-time) ---
@@ -4603,6 +4640,7 @@ async function boot() {
   await seedDefaultsOnce({ freshDeployment });
   await migrateAccessRequests();
   await oidc.init();
+  await idp.init();
 
   // Turn every discovered service into a tenant. Idempotent: existing tenants
   // keep their roles, members and admins.

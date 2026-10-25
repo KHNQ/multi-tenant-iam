@@ -4180,7 +4180,11 @@ async function runBootstrapTests() {
     return;
   }
   const passwordFile = path.join(scratch.dir, 'admin-password');
-  const env = (file) => ({ REDIS_URL: scratch.url, INITIAL_ADMIN_PASSWORD_FILE: file });
+  // The console's first administrator gets a one-time password file too; a
+  // scratch gateway must not overwrite the real deployment's.
+  const env = (file) => ({
+    REDIS_URL: scratch.url, INITIAL_ADMIN_PASSWORD_FILE: file, IDP_BOOTSTRAP_PASSWORD_FILE: path.join(scratch.dir, 'console-admin-password'),
+  });
 
   try {
     await test('If the password file cannot be written, the gateway refuses to start and creates nothing', async () => {

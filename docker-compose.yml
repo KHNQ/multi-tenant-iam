@@ -1,0 +1,63 @@
+# The failover IdP with its Redis and the service registry.
+#
+#   cp .env.example .env      # set JWT_SECRET, PUBLIC_URL, KEYCLOAK_* … (docs/failover-idp.md)
+#   docker compose up -d
+#
+# Images come from Docker Hub (redis) or are built/loaded locally (iam), so the
+# stack starts without Internet access once the images are on the host. TLS is
+# terminated by the reverse proxy in front of port 3000 (set TRUST_PROXY).
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "300", "10"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+
+  registry:
+    image: ${IAM_IMAGE:-iam-failover-idp:latest}
+    command: ["node", "src/registery.js"]
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      PORT: "3001"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+
+  iam:
+    image: ${IAM_IMAGE:-iam-failover-idp:latest}
+    build: .
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      REGISTRY_URL: http://registry:3001
+      PORT: "3000"
+      INITIAL_ADMIN_PASSWORD_FILE: /app/.run/initial-admin-password
+      IDP_BOOTSTRAP_PASSWORD_FILE: /app/.run/initial-console-admin-password
+    ports:
+      - "3000:3000"
+    volumes:
+      - iam-run:/app/.run
+      - iam-logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      registry:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  iam-run:
+  iam-logs:

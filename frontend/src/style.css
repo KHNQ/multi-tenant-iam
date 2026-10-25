@@ -1,0 +1,125 @@
+@import "tailwindcss";
+@import "./applications.css";
+
+/*
+ * IAM-0207 design tokens.
+ *
+ * Every colour is a CSS custom property rather than a hard-coded utility so that
+ * a future microfrontend can be dropped onto a host page and inherit the same
+ * palette by importing this one file - no shared build, no version coupling.
+ * Names are namespaced --iam-* to survive sharing a document with other apps.
+ *
+ * Light is the default (conventional for admin consoles, and the easier baseline
+ * for contrast); dark follows the OS unless a .dark class is set explicitly.
+ */
+@theme inline {
+  --color-surface: var(--iam-surface);
+  --color-surface-raised: var(--iam-surface-raised);
+  --color-border-subtle: var(--iam-border);
+  --color-content: var(--iam-content);
+  --color-content-muted: var(--iam-content-muted);
+  --color-brand: var(--iam-brand);
+  --color-brand-content: var(--iam-brand-content);
+  --color-danger: var(--iam-danger);
+  --color-danger-surface: var(--iam-danger-surface);
+  --color-success: var(--iam-success);
+  --color-warning: var(--iam-warning);
+}
+
+:root,
+:host {
+  --iam-surface: oklch(0.99 0 0);
+  --iam-surface-raised: oklch(1 0 0);
+  --iam-border: oklch(0.90 0.005 250);
+  --iam-content: oklch(0.22 0.01 250);
+  --iam-content-muted: oklch(0.50 0.01 250);
+  --iam-brand: oklch(0.53 0.17 258);
+  --iam-brand-content: oklch(0.99 0 0);
+  --iam-danger: oklch(0.52 0.20 27);
+  --iam-danger-surface: oklch(0.96 0.03 27);
+  --iam-success: oklch(0.55 0.14 155);
+  --iam-warning: oklch(0.62 0.15 75);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light),
+  :host(:not(.light)) {
+    --iam-surface: oklch(0.18 0.01 250);
+    --iam-surface-raised: oklch(0.23 0.01 250);
+    --iam-border: oklch(0.33 0.01 250);
+    --iam-content: oklch(0.96 0.005 250);
+    --iam-content-muted: oklch(0.72 0.01 250);
+    --iam-brand: oklch(0.70 0.15 258);
+    --iam-brand-content: oklch(0.18 0.01 250);
+    --iam-danger: oklch(0.70 0.17 27);
+    --iam-danger-surface: oklch(0.28 0.06 27);
+    --iam-success: oklch(0.72 0.13 155);
+    --iam-warning: oklch(0.78 0.14 75);
+  }
+}
+
+.dark,
+:host(.dark) {
+  --iam-surface: oklch(0.18 0.01 250);
+  --iam-surface-raised: oklch(0.23 0.01 250);
+  --iam-border: oklch(0.33 0.01 250);
+  --iam-content: oklch(0.96 0.005 250);
+  --iam-content-muted: oklch(0.72 0.01 250);
+  --iam-brand: oklch(0.70 0.15 258);
+  --iam-brand-content: oklch(0.18 0.01 250);
+  --iam-danger: oklch(0.70 0.17 27);
+  --iam-danger-surface: oklch(0.28 0.06 27);
+  --iam-success: oklch(0.72 0.13 155);
+  --iam-warning: oklch(0.78 0.14 75);
+}
+
+@layer base {
+  body,
+  [data-iam-root] {
+    background-color: var(--iam-surface);
+    color: var(--iam-content);
+    font-family: var(--iam-font, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif);
+  }
+
+  dialog::backdrop {
+    background: rgb(0 0 0 / 55%);
+  }
+
+  [dir="rtl"] .font-mono,
+  [dir="rtl"] code {
+    direction: ltr;
+    text-align: left;
+  }
+
+  /*
+   * Focus is never removed, only restyled - the keyboard flow is an acceptance
+   * criterion, and an invisible focus ring is the most common way admin consoles
+   * fail it.
+   */
+  :focus-visible {
+    outline: 2px solid var(--iam-brand);
+    outline-offset: 2px;
+    border-radius: 0.25rem;
+  }
+}
+
+/* The mount root overrides standalone defaults inside the isolated shadow tree. */
+[data-iam-root].dark { color-scheme: dark; }
+[data-iam-root].light { color-scheme: light; }
+[data-iam-embedded="true"] {
+  --radius-lg: var(--iam-radius, 0.5rem);
+  --radius-md: max(0px, calc(var(--iam-radius, 0.5rem) - 2px));
+  --radius-sm: max(0px, calc(var(--iam-radius, 0.5rem) - 4px));
+  --font-mono: var(--iam-font-mono, ui-monospace, monospace);
+}
+[data-iam-embedded="true"] :focus-visible { outline-color: var(--iam-ring, var(--iam-brand)); }
+[data-iam-embedded="true"] button { border-radius: 0; }
+[data-iam-embedded="true"] button.h-9 { height: 2.125rem; padding-inline: 0.75rem; font-size: 0.8125rem; }
+[data-iam-embedded="true"] button.h-8 { height: 1.75rem; }
+[data-iam-embedded="true"] button.bg-danger { color: var(--iam-danger-content, white); }
+[data-iam-embedded="true"] :is(input, select, textarea) { border-color: var(--iam-input, var(--iam-border)); }
+[data-iam-embedded="true"] nav a:hover,
+[data-iam-embedded="true"] nav a[aria-current="page"] {
+  background: var(--iam-accent, var(--iam-surface-raised));
+  color: var(--iam-accent-content, var(--iam-content));
+}

@@ -22,7 +22,10 @@
     "backup:verify": "node src/backup/redis-backup.js verify",
     "backup:drill": "node src/backup/redis-backup.js drill",
     "backup:selftest": "node src/backup/selftest.js",
-    "test:smoke": "node --test test/main.test.js"
+    "test:smoke": "node --test test/main.test.js",
+    "test:idp": "node --test --test-concurrency=1 test/idp/acceptance.test.js test/idp/fresh.test.js",
+    "idp": "node src/idp/cli.js",
+    "build:ui": "npm --prefix frontend ci && npm --prefix frontend run build"
   },
   "dependencies": {
     "argon2": "^0.45.1",

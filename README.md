@@ -750,6 +750,12 @@ curl localhost:3000/gateway/llm/claude      -H "authorization: Bearer $BOB_TOKEN
 
 Or do the same thing in the browser at `/tenant-ui/`.
 
+## Appendix B: Failover Identity Provider and the Administration Console
+
+The gateway also serves a Keycloak-compatible OpenID Connect provider with realms (`/realms/{realm}/protocol/openid-connect/*`, `src/idp/`) that can stand in for the primary Keycloak — same token contract, same `sub` — and stays up when Keycloak is down. Realms are synchronised one way from Keycloak's Admin API; password hashes are imported from its database; the system runs in *standby* (read-only administration) or *primary* mode. The Vue administration console in `frontend/` is served at `/ui/`, backed by `src/bff/`, which implements the API it was written against.
+
+To try everything on one machine: `./boot.sh` (demo: this system as the primary IdP, with demo tenants) or `./boot.sh failover` (a stand-in Keycloak synchronised in standby; `./boot.sh keycloak-stop` simulates its outage). Installation, configuration, synchronisation, credential import, key rotation, mode switching, health checks and the console are described in [docs/failover-idp.md](docs/failover-idp.md).
+
 ## References
 
 - Sandhu, R., Coyne, E., Feinstein, H., Youman, C. — *Role-Based Access Control Models*, IEEE Computer, 1996.
