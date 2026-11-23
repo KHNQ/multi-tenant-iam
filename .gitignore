@@ -16,3 +16,13 @@ dump.rdb
 backup-keys/
 *.rdb.enc
 *.manifest.json
+
+# reports and slide decks are kept locally, not in the repo
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.key
+*.pdf
+slides.*
+presentation_figures/
